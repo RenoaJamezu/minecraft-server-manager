@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: #09090b;
+}
+
+/* Players page layout */
+.players-stats-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1rem;
+}
+
+@media (min-width: 640px) {
+  .players-stats-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* Keep the player dialog constrained on desktop */
+.player-dialog-panel {
+  width: min(100%, 32rem);
+  max-height: 90vh;
+  flex: 0 1 32rem;
+}
