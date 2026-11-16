@@ -81,6 +81,16 @@ export default function TransactionTable({
               transactions.map((transaction) => {
                 const isIncome = transaction.kind === "income";
 
+                const typeLabel = isIncome ? "Income" : "Expense";
+
+                const typeStyles = isIncome
+                  ? "bg-emerald-500/10 text-emerald-400"
+                  : "bg-red-500/10 text-red-400";
+
+                const amountStyles = isIncome
+                  ? "text-emerald-400"
+                  : "text-red-400";
+
                 return (
                   <tr
                     key={transaction.id}
@@ -102,17 +112,13 @@ export default function TransactionTable({
                       {formatLabel(transaction.category)}
                     </td>
 
-                    <td className="px-5 py-4 whitespace-nowrap text-sm text-zinc-500">
+                    <td className="whitespace-nowrap px-5 py-4 text-sm text-zinc-500">
                       {formatDate(transaction.date)}
                     </td>
 
                     <td className="px-5 py-4">
                       <span
-                        className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${
-                          isIncome
-                            ? "bg-emerald-500/10 text-emerald-400"
-                            : "bg-red-500/10 text-red-400"
-                        }`}
+                        className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${typeStyles}`}
                       >
                         {isIncome ? (
                           <ArrowDownLeft size={13} />
@@ -120,17 +126,14 @@ export default function TransactionTable({
                           <ArrowUpRight size={13} />
                         )}
 
-                        {isIncome ? "Income" : "Expense"}
+                        {typeLabel}
                       </span>
                     </td>
 
                     <td
-                      className={`px-5 py-4 text-right text-sm font-semibold ${
-                        isIncome ? "text-emerald-400" : "text-red-400"
-                      }`}
+                      className={`px-5 py-4 text-right text-sm font-semibold ${amountStyles}`}
                     >
-                      {isIncome ? "+" : "-"}
-                      {formatCurrency(Number(transaction.amount))}
+                      {`${isIncome ? "+" : "-"}${formatCurrency(Math.abs(Number(transaction.amount)))}`}
                     </td>
                   </tr>
                 );

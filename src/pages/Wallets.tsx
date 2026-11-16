@@ -58,10 +58,13 @@ export default function Wallets() {
     });
   }, [players, search, filter]);
 
-  const handlePayment = (values: PaymentFormValues) => recordPayment(values);
+  const handlePayment = (values: PaymentFormValues, requestId: string) =>
+    recordPayment(values, requestId);
 
-  const handleWalletSpend = (values: WalletSpendFormValues) =>
-    recordWalletSpend(values);
+  const handleWalletSpend = (
+    values: WalletSpendFormValues,
+    requestId: string,
+  ) => recordWalletSpend(values, requestId);
 
   const handleWalletWithdrawal = (values: WalletWithdrawalFormValues) =>
     withdrawWalletBalance(values);

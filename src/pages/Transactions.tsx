@@ -35,7 +35,7 @@ export default function Transactions() {
         </h1>
 
         <p className="mt-1 text-sm text-zinc-500">
-          View and manage your recorded income and server expenses.
+          View recorded income and server expenses.
         </p>
       </div>
 

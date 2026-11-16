@@ -17,13 +17,18 @@ interface WalletHistoryDialogProps {
 }
 
 const formatDate = (value: string) => {
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(value)
-    ? new Date(`${value}T00:00:00`)
+  if (!value) return "—";
+
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value);
+  const date = isDateOnly
+    ? new Date(`${value}T00:00:00+08:00`)
     : new Date(value);
 
+  if (Number.isNaN(date.getTime())) return "—";
+
   return new Intl.DateTimeFormat("en-PH", {
+    timeZone: "Asia/Manila",
     dateStyle: "medium",
-    ...(value.includes("T") ? { timeStyle: "short" as const } : {}),
   }).format(date);
 };
 
@@ -72,7 +77,7 @@ export default function WalletHistoryDialog({
         <div className="flex items-center justify-between border-b border-white/[0.06] px-5 py-4">
           <div>
             <h2 className="text-base font-semibold text-white">
-              Wallet & Payment History
+              Wallet History
             </h2>
             <p className="mt-1 text-xs text-zinc-500">
               {player.minecraft_username} · Current balance{" "}
@@ -93,90 +98,77 @@ export default function WalletHistoryDialog({
         <div className="overflow-y-auto p-5">
           {loading ? (
             <p className="py-10 text-center text-sm text-zinc-500">
-              Loading payment history...
+              Loading wallet history...
             </p>
           ) : transactions.length === 0 ? (
             <div className="py-10 text-center">
               <p className="text-sm font-medium text-white">
-                No payment history yet
+                No wallet history yet
               </p>
               <p className="mt-1 text-sm text-zinc-500">
-                Payments and wallet transactions will appear here.
+                Payment allocations and wallet movements will appear here.
               </p>
             </div>
           ) : (
             <div className="space-y-3">
-              {transactions.map((transaction) => (
-                <div
-                  key={transaction.id}
-                  className="rounded-xl border border-white/[0.06] bg-white/[0.02] p-4"
-                >
-                  {transaction.kind === "payment" ? (
-                    <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-start">
-                      <div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-medium text-white">
-                            {getPurposeLabel(transaction.purpose)}
-                          </p>
+              {transactions.map((transaction) => {
+                const isPayment = transaction.kind === "payment";
+
+                const category = isPayment
+                  ? getPurposeLabel(transaction.purpose)
+                  : getTransactionLabel(
+                      transaction.transaction_type ?? "transaction",
+                    );
+
+                const amount = isPayment
+                  ? (transaction.allocated_amount ?? 0)
+                  : transaction.amount;
+
+                return (
+                  <div
+                    key={transaction.id}
+                    className="flex items-start justify-between gap-4 rounded-xl border border-white/[0.06] bg-white/[0.02] p-4"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-medium text-white">{category}</p>
+
+                        {isPayment && (
                           <span className="rounded-md bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-400">
                             Payment
                           </span>
-                        </div>
+                        )}
+                      </div>
 
+                      {isPayment && transaction.payer_username && (
                         <p className="mt-1 text-xs text-zinc-500">
                           Paid by {transaction.payer_username}
                         </p>
+                      )}
 
-                        {transaction.description && (
-                          <p className="mt-1 text-xs text-zinc-500">
-                            {transaction.description}
-                          </p>
-                        )}
-                      </div>
-
-                      <div className="sm:text-right">
-                        <p className="font-semibold text-emerald-400">
-                          +{formatCurrency(transaction.allocated_amount ?? 0)}
+                      {transaction.description && (
+                        <p className="mt-1 break-words text-xs text-zinc-500">
+                          {transaction.description}
                         </p>
-                        <p className="mt-1 text-xs text-zinc-500">
-                          {formatDate(transaction.date)}
-                        </p>
-                      </div>
+                      )}
                     </div>
-                  ) : (
-                    <div className="flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
-                      <div>
-                        <p className="font-medium capitalize text-white">
-                          {getTransactionLabel(
-                            transaction.transaction_type ?? "transaction",
-                          )}
-                        </p>
 
-                        {transaction.description && (
-                          <p className="mt-1 text-xs text-zinc-500">
-                            {transaction.description}
-                          </p>
-                        )}
-
-                        <p className="mt-1 text-xs text-zinc-500">
-                          {formatDate(transaction.date)}
-                        </p>
-                      </div>
-
+                    <div className="shrink-0 text-right">
                       <p
                         className={`font-semibold ${
-                          transaction.amount > 0
-                            ? "text-emerald-400"
-                            : "text-rose-400"
+                          amount > 0 ? "text-emerald-400" : "text-rose-400"
                         }`}
                       >
-                        {transaction.amount > 0 ? "+" : ""}
-                        {formatCurrency(transaction.amount)}
+                        {amount > 0 ? "+" : ""}
+                        {formatCurrency(amount)}
+                      </p>
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {formatDate(transaction.date)}
                       </p>
                     </div>
-                  )}
-                </div>
-              ))}
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>

@@ -68,6 +68,7 @@ export interface WalletSpendFormValues {
 
 export interface WalletSpendAllocationResult {
   wallet_transaction_id: string;
+  created_at: string;
   purpose: PaymentPurpose;
   description: string | null;
   amount: number;

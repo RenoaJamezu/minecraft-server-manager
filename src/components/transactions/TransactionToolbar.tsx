@@ -37,7 +37,7 @@ export default function TransactionToolbar({
         />
       </div>
 
-      <div className="flex items-center gap-1 self-start rounded-lg bg-zinc-950 p-1">
+      <div className="flex flex-wrap items-center gap-1 self-start rounded-lg bg-zinc-950 p-1">
         {filters.map((item) => (
           <button
             key={item.value}

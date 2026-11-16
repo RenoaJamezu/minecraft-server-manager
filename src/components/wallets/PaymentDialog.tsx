@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { Plus, Trash2, Wallet, X } from "lucide-react";
 import { formatCurrency } from "../../lib/formatters";
 import type {
@@ -17,6 +17,7 @@ interface PaymentDialogProps {
   onClose: () => void;
   onSubmit: (
     values: PaymentFormValues,
+    requestId: string,
   ) => Promise<{ error: string | null; result?: WalletPaymentResult }>;
 }
 
@@ -26,6 +27,11 @@ interface AllocationDraft {
   amount: string;
   purpose: PaymentPurpose;
   description: string;
+}
+
+interface PaymentRequest {
+  fingerprint: string;
+  requestId: string;
 }
 
 const getToday = () => {
@@ -72,6 +78,9 @@ export default function PaymentDialog({
   const [error, setError] = useState("");
   const [result, setResult] = useState<WalletPaymentResult | null>(null);
 
+  const paymentRequestRef = useRef<PaymentRequest | null>(null);
+  const submittingRef = useRef(false);
+
   useEffect(() => {
     if (open && player) {
       setPayerId(player.id);
@@ -81,6 +90,11 @@ export default function PaymentDialog({
       setAllocations([createAllocation(player.id)]);
       setError("");
       setResult(null);
+
+      paymentRequestRef.current = null;
+      submittingRef.current = false;
+    } else {
+      paymentRequestRef.current = null;
     }
   }, [open, player?.id]);
 
@@ -162,6 +176,9 @@ export default function PaymentDialog({
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+
+    if (submittingRef.current || saving) return;
+
     setError("");
 
     if (!payerId) {
@@ -206,15 +223,58 @@ export default function PaymentDialog({
       ),
     };
 
-    const response = await onSubmit(values);
+    // Match the database's normalized request payload.
+    // Allocation order is preserved because it is significant.
+    const fingerprint = JSON.stringify({
+      payer_player_id: values.payer_player_id,
+      amount: Number(values.amount),
+      payment_date: values.payment_date,
+      notes: values.notes.trim() || null,
+      allocations: values.allocations.map((allocation) => ({
+        player_id: allocation.player_id,
+        purpose: allocation.purpose,
+        amount: Number(allocation.amount),
+        description: allocation.description?.trim() || null,
+      })),
+    });
 
-    if (response.error) {
-      setError(response.error);
-      return;
+    // Reuse the UUID only when the submitted payment is unchanged.
+    if (paymentRequestRef.current?.fingerprint !== fingerprint) {
+      paymentRequestRef.current = {
+        fingerprint,
+        requestId: crypto.randomUUID(),
+      };
     }
 
-    if (response.result) {
-      setResult(response.result);
+    const requestId = paymentRequestRef.current.requestId;
+
+    submittingRef.current = true;
+
+    try {
+      const response = await onSubmit(values, requestId);
+
+      if (response.error) {
+        // Keep the request ID so an unchanged retry is idempotent.
+        setError(response.error);
+        return;
+      }
+
+      if (response.result) {
+        setResult(response.result);
+
+        // The payment succeeded. A future payment must get a new UUID.
+        paymentRequestRef.current = null;
+      }
+    } catch (submitError) {
+      console.error("Unexpected payment submission error:", submitError);
+
+      // Keep the UUID because the server may have processed the request
+      // even if the client did not receive its response.
+      setError(
+        "An unexpected error occurred. You can safely retry this payment.",
+      );
+    } finally {
+      submittingRef.current = false;
     }
   };
 
