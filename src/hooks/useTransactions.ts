@@ -35,6 +35,11 @@ function consumeCount(counts: Map<string, number>, key: string | null) {
   return true;
 }
 
+interface DatedTransaction {
+  transaction: Transaction;
+  createdAt: string;
+}
+
 export function useTransactions() {
   const { user } = useAuth();
 
@@ -58,16 +63,18 @@ export function useTransactions() {
           supabase
             .from("income_transactions")
             .select(
-              "id, player_id, source_type, description, amount, income_date",
+              "id, player_id, source_type, description, amount, income_date, created_at, wallet_transaction_id",
             )
             .eq("owner_id", user.id)
-            .order("income_date", { ascending: false }),
+            .order("income_date", { ascending: false })
+            .order("created_at", { ascending: false }),
 
           supabase
             .from("expenses")
-            .select("id, title, category, amount, expense_date")
+            .select("id, title, category, amount, expense_date, created_at")
             .eq("owner_id", user.id)
-            .order("expense_date", { ascending: false }),
+            .order("expense_date", { ascending: false })
+            .order("created_at", { ascending: false }),
 
           supabase
             .from("player_payment_allocations")
@@ -85,17 +92,20 @@ export function useTransactions() {
       const membershipAllocations = membershipResult.data ?? [];
       const expenseRows = expenseResult.data ?? [];
 
-      // Retrieve original cash payment dates for membership allocations.
+      // Retrieve original cash payment dates and recording timestamps.
       const paymentIds = [
         ...new Set(membershipAllocations.map((item) => item.payment_id)),
       ];
 
-      let paymentMap = new Map<string, { id: string; payment_date: string }>();
+      let paymentMap = new Map<
+        string,
+        { id: string; payment_date: string; created_at: string }
+      >();
 
       if (paymentIds.length > 0) {
         const { data, error: paymentsError } = await supabase
           .from("player_payments")
-          .select("id, payment_date")
+          .select("id, payment_date, created_at")
           .eq("owner_id", user.id)
           .in("id", paymentIds);
 
@@ -132,6 +142,10 @@ export function useTransactions() {
       }
 
       const filteredIncomeRows = incomeRows.filter((item) => {
+        if (item.wallet_transaction_id) {
+          return true;
+        }
+
         if (item.source_type?.trim().toLowerCase() !== "membership") {
           return true;
         }
@@ -174,44 +188,71 @@ export function useTransactions() {
       }
 
       // Custom title, other, and wallet-funded membership income.
-      const income: Transaction[] = filteredIncomeRows.map((item) => ({
-        id: `income-${item.id}`,
-        player: item.player_id ? (playerMap.get(item.player_id) ?? null) : null,
-        description: item.description || "Income",
-        category: item.source_type || "Other",
-        date: item.income_date,
-        amount: Number(item.amount || 0),
-        kind: "income",
+      const income: DatedTransaction[] = filteredIncomeRows.map((item) => ({
+        transaction: {
+          id: `income-${item.id}`,
+          player: item.player_id
+            ? (playerMap.get(item.player_id) ?? null)
+            : null,
+          description: item.description || "Income",
+          category: item.wallet_transaction_id
+            ? "Wallet Spend"
+            : item.source_type || "Other",
+          date: item.income_date,
+          amount: Number(item.amount || 0),
+          kind: "income",
+        },
+        createdAt: item.created_at,
       }));
 
       // Cash membership payments are sourced from allocations.
-      const membershipIncome: Transaction[] = datedMembershipAllocations.map(
-        ({ allocation, payment }) => ({
-          id: `membership-${allocation.id}`,
-          player: playerMap.get(allocation.player_id) ?? null,
-          description: allocation.description || "Membership payment",
-          category: "Membership",
-          date: payment.payment_date,
-          amount: Number(allocation.amount || 0),
-          kind: "income",
-        }),
-      );
+      const membershipIncome: DatedTransaction[] =
+        datedMembershipAllocations.map(({ allocation, payment }) => ({
+          transaction: {
+            id: `membership-${allocation.id}`,
+            player: playerMap.get(allocation.player_id) ?? null,
+            description: allocation.description || "Membership payment",
+            category: "Membership",
+            date: payment.payment_date,
+            amount: Number(allocation.amount || 0),
+            kind: "income",
+          },
+          createdAt: payment.created_at,
+        }));
 
-      const expenses: Transaction[] = expenseRows.map((item) => ({
-        id: `expense-${item.id}`,
-        player: null,
-        description: item.title,
-        category: item.category || "Other",
-        date: item.expense_date,
-        amount: Number(item.amount || 0),
-        kind: "expense",
+      const expenses: DatedTransaction[] = expenseRows.map((item) => ({
+        transaction: {
+          id: `expense-${item.id}`,
+          player: null,
+          description: item.title,
+          category: item.category || "Other",
+          date: item.expense_date,
+          amount: Number(item.amount || 0),
+          kind: "expense",
+        },
+        createdAt: item.created_at,
       }));
 
+      // Sort by transaction date first, then exact recording timestamp.
+      // Use ID as a deterministic final tie-breaker.
       const combined = [...income, ...membershipIncome, ...expenses].sort(
-        (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+        (a, b) => {
+          const dateComparison = b.transaction.date.localeCompare(
+            a.transaction.date,
+          );
+
+          if (dateComparison !== 0) return dateComparison;
+
+          const timestampComparison =
+            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+
+          if (timestampComparison !== 0) return timestampComparison;
+
+          return b.transaction.id.localeCompare(a.transaction.id);
+        },
       );
 
-      setTransactions(combined);
+      setTransactions(combined.map((item) => item.transaction));
     } catch (err) {
       console.error("Failed to fetch transactions:", err);
       setError("Unable to load transactions. Please try again.");

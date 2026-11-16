@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { CheckCircle2, Plus, Trash2, Wallet, X } from "lucide-react";
 import { formatCurrency } from "../../lib/formatters";
 import type {
@@ -15,6 +15,7 @@ interface WalletSpendDialogProps {
   onClose: () => void;
   onSubmit: (
     values: WalletSpendFormValues,
+    requestId: string,
   ) => Promise<{ error: string | null; result?: WalletSpendResult }>;
 }
 
@@ -40,6 +41,19 @@ const purposeLabels: Record<PaymentPurpose, string> = {
   other: "Other",
 };
 
+function formatDate(value: string) {
+  if (!value) return "Date unavailable";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return "Date unavailable";
+
+  return new Intl.DateTimeFormat("en-PH", {
+    dateStyle: "medium",
+    timeZone: "Asia/Manila",
+  }).format(date);
+}
+
 export default function WalletSpendDialog({
   player,
   open,
@@ -53,11 +67,15 @@ export default function WalletSpendDialog({
   const [error, setError] = useState("");
   const [result, setResult] = useState<WalletSpendResult | null>(null);
 
+  // Keep the same request ID when retrying an unchanged submission.
+  const requestIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (open) {
       setAllocations([createAllocation()]);
       setError("");
       setResult(null);
+      requestIdRef.current = null;
     }
   }, [open, player?.id]);
 
@@ -77,24 +95,31 @@ export default function WalletSpendDialog({
   const remainingCents = balanceCents - totalCents;
 
   const updateAllocation = (id: string, updates: Partial<AllocationDraft>) => {
+    requestIdRef.current = null;
+
     setAllocations((current) =>
       current.map((allocation) =>
         allocation.id === id ? { ...allocation, ...updates } : allocation,
       ),
     );
+
     setError("");
   };
 
   const addAllocation = () => {
+    requestIdRef.current = null;
     setAllocations((current) => [...current, createAllocation()]);
   };
 
   const removeAllocation = (id: string) => {
+    requestIdRef.current = null;
+
     setAllocations((current) =>
       current.length > 1
         ? current.filter((allocation) => allocation.id !== id)
         : current,
     );
+
     setError("");
   };
 
@@ -157,10 +182,17 @@ export default function WalletSpendDialog({
       return;
     }
 
-    const response = await onSubmit({
-      player_id: player.id,
-      allocations: parsedAllocations,
-    });
+    // Reuse the request ID if this exact submission is retried.
+    const requestId = requestIdRef.current ?? crypto.randomUUID();
+    requestIdRef.current = requestId;
+
+    const response = await onSubmit(
+      {
+        player_id: player.id,
+        allocations: parsedAllocations,
+      },
+      requestId,
+    );
 
     if (response.error) {
       setError(response.error);
@@ -172,6 +204,7 @@ export default function WalletSpendDialog({
       return;
     }
 
+    requestIdRef.current = null;
     setResult(response.result);
   };
 
@@ -193,7 +226,6 @@ export default function WalletSpendDialog({
         aria-labelledby="wallet-spend-title"
         className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-white/[0.08] bg-[#111114] shadow-2xl"
       >
-        {/* Sticky header: stays visible while content scrolls */}
         <div className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-5 py-4">
           <div>
             <div className="flex items-center gap-2">
@@ -271,6 +303,10 @@ export default function WalletSpendDialog({
                           {allocation.description}
                         </p>
                       )}
+
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {formatDate(allocation.created_at)}
+                      </p>
                     </div>
                     <p className="shrink-0 text-sm font-medium text-white">
                       {formatCurrency(allocation.amount)}

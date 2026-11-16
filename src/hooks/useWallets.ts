@@ -75,6 +75,7 @@ export function useWallets() {
   const recordPayment = useCallback(
     async (
       values: PaymentFormValues,
+      requestId: string,
     ): Promise<{ error: string | null; result?: WalletPaymentResult }> => {
       const amount = Number(values.amount);
 
@@ -98,6 +99,10 @@ export function useWallets() {
 
       if (!values.allocations.length) {
         return { error: "Add at least one allocation." };
+      }
+
+      if (!requestId) {
+        return { error: "Payment request ID is missing. Please try again." };
       }
 
       if (!user) {
@@ -168,6 +173,7 @@ export function useWallets() {
               purpose: allocation.purpose,
               description: allocation.description?.trim() || null,
             })),
+            p_request_id: requestId,
             p_payment_date: values.payment_date,
             p_notes: values.notes.trim() || null,
           },
@@ -214,6 +220,7 @@ export function useWallets() {
   const recordWalletSpend = useCallback(
     async (
       values: WalletSpendFormValues,
+      requestId: string,
     ): Promise<{ error: string | null; result?: WalletSpendResult }> => {
       if (!user) {
         return {
@@ -281,6 +288,7 @@ export function useWallets() {
               purpose: allocation.purpose,
               description: allocation.description?.trim() || null,
             })),
+            p_request_id: requestId,
           },
         );
 
@@ -404,121 +412,137 @@ export function useWallets() {
     [user, players, fetchWallets],
   );
 
-  const fetchHistory = useCallback(async (playerId: string) => {
-    setHistoryLoading(true);
-    setTransactions([]);
-    setError("");
-
-    try {
-      const [allocationResult, walletResult] = await Promise.all([
-        supabase
-          .from("player_payment_allocations")
-          .select("id, payment_id, player_id, amount, purpose, description")
-          .eq("player_id", playerId),
-
-        supabase
-          .from("wallet_transactions")
-          .select(
-            "id, transaction_type, amount, description, created_at, payment_id",
-          )
-          .eq("player_id", playerId)
-          .order("created_at", { ascending: false }),
-      ]);
-
-      if (allocationResult.error) throw allocationResult.error;
-      if (walletResult.error) throw walletResult.error;
-
-      const allocations = allocationResult.data ?? [];
-      const walletRows = walletResult.data ?? [];
-
-      const paymentIds = [...new Set(allocations.map((row) => row.payment_id))];
-
-      let payments: {
-        id: string;
-        payment_date: string;
-        player_id: string;
-        amount: number;
-        notes: string | null;
-      }[] = [];
-
-      if (paymentIds.length > 0) {
-        const { data, error: paymentsError } = await supabase
-          .from("player_payments")
-          .select("id, payment_date, player_id, amount, notes")
-          .in("id", paymentIds);
-
-        if (paymentsError) throw paymentsError;
-        payments = data ?? [];
+  const fetchHistory = useCallback(
+    async (playerId: string) => {
+      if (!user) {
+        setTransactions([]);
+        setHistoryLoading(false);
+        return;
       }
 
-      const payerIds = [
-        ...new Set(
-          payments.map((payment) => payment.player_id).filter(Boolean),
-        ),
-      ];
+      setHistoryLoading(true);
+      setTransactions([]);
+      setError("");
 
-      const payerNameMap = new Map<string, string>();
+      try {
+        const [allocationResult, walletResult] = await Promise.all([
+          supabase
+            .from("player_payment_allocations")
+            .select("id, payment_id, player_id, amount, purpose, description")
+            .eq("owner_id", user.id)
+            .eq("player_id", playerId),
 
-      if (payerIds.length > 0) {
-        const { data, error: payerError } = await supabase
-          .from("players")
-          .select("id, minecraft_username")
-          .in("id", payerIds);
+          supabase
+            .from("wallet_transactions")
+            .select(
+              "id, transaction_type, amount, description, created_at, payment_id",
+            )
+            .eq("owner_id", user.id)
+            .eq("player_id", playerId)
+            .order("created_at", { ascending: false }),
+        ]);
 
-        if (payerError) throw payerError;
+        if (allocationResult.error) throw allocationResult.error;
+        if (walletResult.error) throw walletResult.error;
 
-        for (const payer of data ?? []) {
-          payerNameMap.set(payer.id, payer.minecraft_username);
+        const allocations = allocationResult.data ?? [];
+        const walletRows = walletResult.data ?? [];
+
+        const paymentIds = [
+          ...new Set(allocations.map((row) => row.payment_id)),
+        ];
+
+        let payments: {
+          id: string;
+          payment_date: string;
+          player_id: string;
+          amount: number;
+          notes: string | null;
+        }[] = [];
+
+        if (paymentIds.length > 0) {
+          const { data, error: paymentsError } = await supabase
+            .from("player_payments")
+            .select("id, payment_date, player_id, amount, notes")
+            .eq("owner_id", user.id)
+            .in("id", paymentIds);
+
+          if (paymentsError) throw paymentsError;
+
+          payments = data ?? [];
         }
+
+        const payerIds = [
+          ...new Set(
+            payments.map((payment) => payment.player_id).filter(Boolean),
+          ),
+        ];
+
+        const payerNameMap = new Map<string, string>();
+
+        if (payerIds.length > 0) {
+          const { data, error: payerError } = await supabase
+            .from("players")
+            .select("id, minecraft_username")
+            .eq("owner_id", user.id)
+            .in("id", payerIds);
+
+          if (payerError) throw payerError;
+
+          for (const payer of data ?? []) {
+            payerNameMap.set(payer.id, payer.minecraft_username);
+          }
+        }
+
+        const paymentMap = new Map(
+          payments.map((payment) => [payment.id, payment]),
+        );
+
+        const paymentEntries: WalletHistoryEntry[] = allocations.flatMap(
+          (allocation): WalletHistoryEntry[] => {
+            const payment = paymentMap.get(allocation.payment_id);
+
+            if (!payment) return [];
+
+            return [
+              {
+                id: `payment-${allocation.id}`,
+                kind: "payment",
+                date: payment.payment_date,
+                amount: Number(allocation.amount),
+                allocated_amount: Number(allocation.amount),
+                description: allocation.description || payment.notes,
+                purpose: allocation.purpose,
+                payer_username:
+                  payerNameMap.get(payment.player_id) ?? "Unknown payer",
+              },
+            ];
+          },
+        );
+
+        const walletEntries: WalletHistoryEntry[] = walletRows.map((row) => ({
+          id: `transaction-${row.id}`,
+          kind: "transaction",
+          date: row.created_at,
+          amount: Number(row.amount),
+          description: row.description,
+          transaction_type: row.transaction_type,
+        }));
+
+        setTransactions(
+          [...paymentEntries, ...walletEntries].sort(
+            (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+          ),
+        );
+      } catch (historyError) {
+        console.error("Failed to load wallet history:", historyError);
+        setError("Unable to load wallet history. Please try again.");
+      } finally {
+        setHistoryLoading(false);
       }
-
-      const paymentMap = new Map(
-        payments.map((payment) => [payment.id, payment]),
-      );
-
-      const paymentEntries: WalletHistoryEntry[] = allocations.flatMap(
-        (allocation): WalletHistoryEntry[] => {
-          const payment = paymentMap.get(allocation.payment_id);
-
-          if (!payment) return [];
-
-          return [
-            {
-              id: `payment-${allocation.id}`,
-              kind: "payment",
-              date: payment.payment_date,
-              amount: Number(allocation.amount),
-              allocated_amount: Number(allocation.amount),
-              description: allocation.description || payment.notes,
-              purpose: allocation.purpose,
-              payer_username:
-                payerNameMap.get(payment.player_id) ?? "Unknown payer",
-            },
-          ];
-        },
-      );
-
-      const walletEntries: WalletHistoryEntry[] = walletRows.map((row) => ({
-        id: `transaction-${row.id}`,
-        kind: "transaction",
-        date: row.created_at,
-        amount: Number(row.amount),
-        description: row.description,
-        transaction_type: row.transaction_type,
-      }));
-
-      setTransactions(
-        [...paymentEntries, ...walletEntries].sort(
-          (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-        ),
-      );
-    } catch (historyError) {
-      console.error("Failed to load wallet history:", historyError);
-      setError("Unable to load wallet history. Please try again.");
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
+    },
+    [user],
+  );
 
   useEffect(() => {
     void fetchWallets();
