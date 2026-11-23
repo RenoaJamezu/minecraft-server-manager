@@ -1,12 +1,21 @@
-import { Pencil } from "lucide-react";
+import { useState } from "react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Pencil } from "lucide-react";
 import type { Player } from "../../types/player";
 import { getPlayerDisplayStatus } from "../../types/player";
+
+type SortColumn = "player" | "discord" | "joined" | "nextDue" | "status";
+type SortDirection = "asc" | "desc";
 
 interface PlayerTableProps {
   players: Player[];
   loading: boolean;
   totalPlayers: number;
   onEdit: (player: Player) => void;
+}
+
+interface SortState {
+  column: SortColumn;
+  direction: SortDirection;
 }
 
 function formatDate(date: string | null | undefined) {
@@ -19,13 +28,12 @@ function formatDate(date: string | null | undefined) {
   });
 }
 
-function getNextDueDate(player: Player): string {
+function getNextDueDateValue(player: Player): string | null {
   if (
     (player.membership_status === "paid" ||
       player.membership_status === "grace") &&
     player.paid_through
   ) {
-    // Renewal is due the day after the current paid coverage ends.
     const nextDue = new Date(`${player.paid_through}T00:00:00`);
     nextDue.setDate(nextDue.getDate() + 1);
 
@@ -33,21 +41,27 @@ function getNextDueDate(player: Player): string {
     const month = String(nextDue.getMonth() + 1).padStart(2, "0");
     const day = String(nextDue.getDate()).padStart(2, "0");
 
-    return formatDate(`${year}-${month}-${day}`);
+    return `${year}-${month}-${day}`;
   }
 
   if (player.membership_status === "scheduled" && player.next_period_start) {
-    return formatDate(player.next_period_start);
+    return player.next_period_start;
   }
 
-  if (
+  return null;
+}
+
+function isDueNow(player: Player): boolean {
+  return (
     player.membership_status === "expired" ||
     player.membership_status === "unpaid"
-  ) {
-    return "Due now";
-  }
+  );
+}
 
-  return "—";
+function getNextDueDate(player: Player): string {
+  if (isDueNow(player)) return "Due now";
+
+  return formatDate(getNextDueDateValue(player));
 }
 
 function getStatusClass(status: string) {
@@ -63,24 +77,156 @@ function getStatusClass(status: string) {
   }
 }
 
+function getSortValue(player: Player, column: SortColumn): string | null {
+  switch (column) {
+    case "player":
+      return player.minecraft_username;
+    case "discord":
+      return player.discord_username;
+    case "joined":
+      return player.joined_at;
+    case "nextDue":
+      if (isDueNow(player)) return "";
+      return getNextDueDateValue(player);
+    case "status":
+      return getPlayerDisplayStatus(player);
+  }
+}
+
+function SortableHeader({
+  label,
+  column,
+  sort,
+  onSort,
+  align = "left",
+}: {
+  label: string;
+  column: SortColumn;
+  sort: SortState | null;
+  onSort: (column: SortColumn) => void;
+  align?: "left" | "right";
+}) {
+  const active = sort?.column === column;
+
+  return (
+    <th
+      className={`px-5 py-3 font-medium ${
+        align === "right" ? "text-right" : "text-left"
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => onSort(column)}
+        className={`inline-flex items-center gap-1.5 transition hover:text-white ${
+          active ? "text-emerald-400" : "text-zinc-500"
+        }`}
+      >
+        {label}
+
+        {active ? (
+          sort.direction === "asc" ? (
+            <ArrowUp size={13} />
+          ) : (
+            <ArrowDown size={13} />
+          )
+        ) : (
+          <ArrowUpDown size={13} className="text-zinc-600" />
+        )}
+      </button>
+    </th>
+  );
+}
+
 export default function PlayerTable({
   players,
   loading,
   totalPlayers,
   onEdit,
 }: PlayerTableProps) {
+  const [sort, setSort] = useState<SortState | null>(null);
+
+  function handleSort(column: SortColumn) {
+    setSort((current) => {
+      if (!current || current.column !== column) {
+        return { column, direction: "asc" };
+      }
+
+      if (current.direction === "asc") {
+        return { column, direction: "desc" };
+      }
+
+      return null;
+    });
+  }
+
+  const sortedPlayers = sort
+    ? players
+        .map((player, index) => ({ player, index }))
+        .sort((a, b) => {
+          const aValue = getSortValue(a.player, sort.column);
+          const bValue = getSortValue(b.player, sort.column);
+
+          // Keep missing values at the bottom in either direction.
+          if (aValue === null && bValue === null) return a.index - b.index;
+          if (aValue === null) return 1;
+          if (bValue === null) return -1;
+
+          const comparison = aValue.localeCompare(bValue, undefined, {
+            numeric: true,
+            sensitivity: "base",
+          });
+
+          if (comparison === 0) return a.index - b.index;
+
+          return sort.direction === "asc" ? comparison : -comparison;
+        })
+        .map(({ player }) => player)
+    : players;
+
   return (
     <>
       <div className="overflow-x-auto">
         <table className="w-full min-w-[800px] text-left">
           <thead>
-            <tr className="border-b border-white/[0.06] text-xs text-zinc-500">
-              <th className="px-5 py-3 font-medium">Player</th>
-              <th className="px-5 py-3 font-medium">Discord</th>
-              <th className="px-5 py-3 font-medium">Joined</th>
-              <th className="px-5 py-3 font-medium">Next Due</th>
-              <th className="px-5 py-3 font-medium">Status</th>
-              <th className="px-5 py-3 text-right font-medium">Actions</th>
+            <tr className="border-b border-white/[0.06] text-xs">
+              <SortableHeader
+                label="Player"
+                column="player"
+                sort={sort}
+                onSort={handleSort}
+              />
+
+              <SortableHeader
+                label="Discord"
+                column="discord"
+                sort={sort}
+                onSort={handleSort}
+              />
+
+              <SortableHeader
+                label="Joined"
+                column="joined"
+                sort={sort}
+                onSort={handleSort}
+              />
+
+              <SortableHeader
+                label="Next Due"
+                column="nextDue"
+                sort={sort}
+                onSort={handleSort}
+              />
+
+              <SortableHeader
+                label="Status"
+                column="status"
+                sort={sort}
+                onSort={handleSort}
+              />
+
+              <th className="px-5 py-3 text-right font-medium text-zinc-500">
+                Actions
+              </th>
             </tr>
           </thead>
 
@@ -94,7 +240,7 @@ export default function PlayerTable({
                   Loading players...
                 </td>
               </tr>
-            ) : players.length === 0 ? (
+            ) : sortedPlayers.length === 0 ? (
               <tr>
                 <td colSpan={6} className="px-5 py-12 text-center">
                   <p className="text-sm font-medium text-zinc-300">
@@ -111,7 +257,7 @@ export default function PlayerTable({
                 </td>
               </tr>
             ) : (
-              players.map((player) => {
+              sortedPlayers.map((player) => {
                 const status = getPlayerDisplayStatus(player);
 
                 return (
@@ -178,7 +324,7 @@ export default function PlayerTable({
 
       <div className="border-t border-white/[0.06] px-5 py-3">
         <p className="text-xs text-zinc-500">
-          Showing {players.length} of {totalPlayers} players
+          Showing {sortedPlayers.length} of {totalPlayers} players
         </p>
       </div>
     </>
