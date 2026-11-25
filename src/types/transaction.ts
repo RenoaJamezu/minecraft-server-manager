@@ -1,3 +1,4 @@
+
 export type TransactionKind = "income" | "expense";
 
 export type TransactionFilter = "all" | TransactionKind;
@@ -10,4 +11,7 @@ export interface Transaction {
   amount: number;
   date: string;
   kind: TransactionKind;
+  isReversed?: boolean;
+  reversedAt?: string | null;
+  reversalReason?: string | null;
 }

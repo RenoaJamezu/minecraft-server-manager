@@ -1,4 +1,10 @@
-import { ArrowDownLeft, ArrowLeftRight, ArrowUpRight } from "lucide-react";
+
+import {
+  ArrowDownLeft,
+  ArrowLeftRight,
+  ArrowUpRight,
+  RotateCcw,
+} from "lucide-react";
 import { formatCurrency } from "../../lib/formatters";
 import type { Transaction } from "../../types/transaction";
 
@@ -16,6 +22,15 @@ function formatDate(date: string) {
     month: "short",
     day: "numeric",
     year: "numeric",
+  });
+}
+
+function formatDateTime(date: string) {
+  if (!date) return "—";
+
+  return new Date(date).toLocaleString("en-PH", {
+    dateStyle: "medium",
+    timeStyle: "short",
   });
 }
 
@@ -41,7 +56,7 @@ export default function TransactionTable({
               <th className="px-5 py-3 font-medium">Description</th>
               <th className="px-5 py-3 font-medium">Category</th>
               <th className="px-5 py-3 font-medium">Date</th>
-              <th className="px-5 py-3 font-medium">Type</th>
+              <th className="px-5 py-3 font-medium">Type / Status</th>
               <th className="px-5 py-3 text-right font-medium">Amount</th>
             </tr>
           </thead>
@@ -80,6 +95,7 @@ export default function TransactionTable({
             ) : (
               transactions.map((transaction) => {
                 const isIncome = transaction.kind === "income";
+                const isReversed = Boolean(transaction.isReversed);
 
                 const typeLabel = isIncome ? "Income" : "Expense";
 
@@ -94,7 +110,9 @@ export default function TransactionTable({
                 return (
                   <tr
                     key={transaction.id}
-                    className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02]"
+                    className={`border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02] ${
+                      isReversed ? "bg-amber-500/[0.025]" : ""
+                    }`}
                   >
                     <td className="px-5 py-4">
                       <p className="text-sm font-medium text-zinc-200">
@@ -103,9 +121,33 @@ export default function TransactionTable({
                     </td>
 
                     <td className="px-5 py-4">
-                      <p className="text-sm font-medium text-white">
+                      <p
+                        className={`text-sm font-medium ${
+                          isReversed
+                            ? "text-zinc-400 line-through decoration-zinc-600"
+                            : "text-white"
+                        }`}
+                      >
                         {transaction.description}
                       </p>
+
+                      {isReversed && (
+                        <div className="mt-1.5 space-y-0.5">
+                          <p className="flex items-center gap-1 text-xs font-medium text-amber-400">
+                            <RotateCcw size={12} />
+                            Reversed
+                            {transaction.reversedAt
+                              ? ` · ${formatDateTime(transaction.reversedAt)}`
+                              : ""}
+                          </p>
+
+                          {transaction.reversalReason && (
+                            <p className="text-xs text-zinc-500">
+                              Reason: {transaction.reversalReason}
+                            </p>
+                          )}
+                        </div>
+                      )}
                     </td>
 
                     <td className="px-5 py-4 text-sm text-zinc-400">
@@ -117,21 +159,31 @@ export default function TransactionTable({
                     </td>
 
                     <td className="px-5 py-4">
-                      <span
-                        className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${typeStyles}`}
-                      >
-                        {isIncome ? (
-                          <ArrowDownLeft size={13} />
-                        ) : (
-                          <ArrowUpRight size={13} />
-                        )}
+                      <div className="flex flex-col items-start gap-1.5">
+                        <span
+                          className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${typeStyles}`}
+                        >
+                          {isIncome ? (
+                            <ArrowDownLeft size={13} />
+                          ) : (
+                            <ArrowUpRight size={13} />
+                          )}
 
-                        {typeLabel}
-                      </span>
+                          {typeLabel}
+                        </span>
+
+                        {isReversed && (
+                          <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-400">
+                            Reversed
+                          </span>
+                        )}
+                      </div>
                     </td>
 
                     <td
-                      className={`px-5 py-4 text-right text-sm font-semibold ${amountStyles}`}
+                      className={`px-5 py-4 text-right text-sm font-semibold ${
+                        isReversed ? "text-zinc-500 line-through" : amountStyles
+                      }`}
                     >
                       {`${isIncome ? "+" : "-"}${formatCurrency(Math.abs(Number(transaction.amount)))}`}
                     </td>

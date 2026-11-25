@@ -1,31 +1,43 @@
-import { useCallback, useEffect, useState } from "react";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase } from "../lib/supabase";
+import { useWalletOperations } from "./useWalletOperations";
 import type {
-  PaymentFormValues,
   WalletHistoryEntry,
-  WalletPaymentResult,
   WalletPlayer,
-  WalletSpendFormValues,
-  WalletSpendResult,
-  WalletWithdrawalFormValues,
-  WalletWithdrawalResult,
 } from "../types/wallet";
 
-const toCents = (value: number) => Math.round(value * 100);
+type ReversalResult = {
+  success?: boolean;
+};
 
 export function useWallets() {
-  const { user } = useAuth();
+  const { user, activeWorkspace, workspaceLoading } = useAuth();
 
   const [players, setPlayers] = useState<WalletPlayer[]>([]);
   const [transactions, setTransactions] = useState<WalletHistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [canReversePayments, setCanReversePayments] = useState(false);
   const [error, setError] = useState("");
 
+  const walletRequestRef = useRef(0);
+  const historyRequestRef = useRef(0);
+  const historyPlayerIdRef = useRef<string | null>(null);
+  const fetchHistoryRef = useRef<(playerId: string) => Promise<void>>(
+    async () => {},
+  );
+
+  const serverId = activeWorkspace?.server_id ?? null;
+
   const fetchWallets = useCallback(async () => {
-    if (!user) {
+    const requestId = ++walletRequestRef.current;
+
+    if (workspaceLoading) return;
+
+    if (!user || !serverId) {
       setPlayers([]);
       setLoading(false);
       return;
@@ -34,387 +46,75 @@ export function useWallets() {
     setLoading(true);
     setError("");
 
-    const [playersResult, balancesResult] = await Promise.all([
-      supabase
+    try {
+      const { data: playerRows, error: playersError } = await supabase
         .from("players")
         .select("id, minecraft_username, discord_username, monthly_fee, status")
-        .order("minecraft_username", { ascending: true }),
+        .eq("server_id", serverId)
+        .order("minecraft_username", { ascending: true });
 
-      supabase.from("player_wallet_balances").select("player_id, balance"),
-    ]);
+      if (playersError) throw playersError;
 
-    const fetchError = playersResult.error || balancesResult.error;
+      const playerIds = (playerRows ?? []).map((player) => player.id);
 
-    if (fetchError) {
+      let balanceRows: { player_id: string; balance: number | null }[] = [];
+
+      if (playerIds.length > 0) {
+        const { data, error: balancesError } = await supabase
+          .from("player_wallet_balances")
+          .select("player_id, balance, server_id")
+          .eq("server_id", serverId)
+          .in("player_id", playerIds);
+
+        if (balancesError) throw balancesError;
+        balanceRows = data ?? [];
+      }
+
+      if (requestId !== walletRequestRef.current) return;
+
+      const balanceMap = new Map<string, number>();
+
+      for (const row of balanceRows) {
+        if (row.player_id) {
+          balanceMap.set(row.player_id, Number(row.balance ?? 0));
+        }
+      }
+
+      setPlayers(
+        (playerRows ?? []).map((player) => ({
+          ...player,
+          monthly_fee: Number(player.monthly_fee),
+          balance: balanceMap.get(player.id) ?? 0,
+        })),
+      );
+    } catch (fetchError) {
+      if (requestId !== walletRequestRef.current) return;
+
       console.error("Failed to load wallets:", fetchError);
       setError("Unable to load wallets. Please try again.");
       setPlayers([]);
-      setLoading(false);
-      return;
-    }
-
-    const balanceMap = new Map<string, number>();
-
-    for (const row of balancesResult.data ?? []) {
-      if (row.player_id) {
-        balanceMap.set(row.player_id, Number(row.balance ?? 0));
+    } finally {
+      if (requestId === walletRequestRef.current) {
+        setLoading(false);
       }
     }
-
-    setPlayers(
-      (playersResult.data ?? []).map((player) => ({
-        ...player,
-        monthly_fee: Number(player.monthly_fee),
-        balance: balanceMap.get(player.id) ?? 0,
-      })),
-    );
-
-    setLoading(false);
-  }, [user]);
-
-  const recordPayment = useCallback(
-    async (
-      values: PaymentFormValues,
-      requestId: string,
-    ): Promise<{ error: string | null; result?: WalletPaymentResult }> => {
-      const amount = Number(values.amount);
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0 ||
-        toCents(amount) !== amount * 100
-      ) {
-        return {
-          error: "Enter a valid amount with at most two decimal places.",
-        };
-      }
-
-      if (!values.payment_date) {
-        return { error: "Payment date is required." };
-      }
-
-      if (!values.payer_player_id) {
-        return { error: "Select the person who made the payment." };
-      }
-
-      if (!values.allocations.length) {
-        return { error: "Add at least one allocation." };
-      }
-
-      if (!requestId) {
-        return { error: "Payment request ID is missing. Please try again." };
-      }
-
-      if (!user) {
-        return {
-          error: "Your session has expired. Please sign in again.",
-        };
-      }
-
-      let allocationTotalCents = 0;
-
-      for (const allocation of values.allocations) {
-        const allocationAmount = Number(allocation.amount);
-
-        if (
-          !allocation.player_id ||
-          !["membership", "custom_title", "other"].includes(
-            allocation.purpose,
-          ) ||
-          !Number.isFinite(allocationAmount) ||
-          allocationAmount <= 0 ||
-          toCents(allocationAmount) !== allocationAmount * 100
-        ) {
-          return {
-            error:
-              "Check that every allocation has a valid player, purpose, and amount.",
-          };
-        }
-
-        if (allocation.purpose === "membership") {
-          const beneficiary = players.find(
-            (player) => player.id === allocation.player_id,
-          );
-
-          const monthlyFeeCents = beneficiary
-            ? toCents(beneficiary.monthly_fee)
-            : 0;
-
-          if (
-            monthlyFeeCents <= 0 ||
-            toCents(allocationAmount) % monthlyFeeCents !== 0
-          ) {
-            return {
-              error: `Membership allocation for ${beneficiary?.minecraft_username ?? "the selected player"} must be a complete number of monthly fees.`,
-            };
-          }
-        }
-
-        allocationTotalCents += toCents(allocationAmount);
-      }
-
-      if (allocationTotalCents > toCents(amount)) {
-        return {
-          error: "The total allocations cannot exceed the payment received.",
-        };
-      }
-
-      setSaving(true);
-
-      try {
-        const { data, error: paymentError } = await supabase.rpc(
-          "record_cash_payment",
-          {
-            p_payer_player_id: values.payer_player_id,
-            p_amount: amount,
-            p_allocations: values.allocations.map((allocation) => ({
-              player_id: allocation.player_id,
-              amount: allocation.amount,
-              purpose: allocation.purpose,
-              description: allocation.description?.trim() || null,
-            })),
-            p_request_id: requestId,
-            p_payment_date: values.payment_date,
-            p_notes: values.notes.trim() || null,
-          },
-        );
-
-        if (paymentError) {
-          console.error("Failed to record payment:", paymentError);
-          return {
-            error:
-              paymentError.message ||
-              "Unable to record payment. Please try again.",
-          };
-        }
-
-        const result = data as WalletPaymentResult;
-
-        if (
-          !result?.success ||
-          !result.payment_id ||
-          !Array.isArray(result.allocations)
-        ) {
-          return {
-            error:
-              "The payment could not be confirmed. Please refresh and check your records.",
-          };
-        }
-
-        await fetchWallets();
-
-        return { error: null, result };
-      } catch (paymentError) {
-        console.error("Unexpected payment error:", paymentError);
-
-        return {
-          error: "An unexpected error occurred while recording the payment.",
-        };
-      } finally {
-        setSaving(false);
-      }
-    },
-    [user, players, fetchWallets],
-  );
-
-  const recordWalletSpend = useCallback(
-    async (
-      values: WalletSpendFormValues,
-      requestId: string,
-    ): Promise<{ error: string | null; result?: WalletSpendResult }> => {
-      if (!user) {
-        return {
-          error: "Your session has expired. Please sign in again.",
-        };
-      }
-
-      const player = players.find(
-        (candidate) => candidate.id === values.player_id,
-      );
-
-      if (!player) {
-        return { error: "Player not found. Refresh and try again." };
-      }
-
-      if (!values.allocations.length) {
-        return { error: "Add at least one allocation." };
-      }
-
-      let totalCents = 0;
-
-      for (const allocation of values.allocations) {
-        const amount = Number(allocation.amount);
-
-        if (
-          !["membership", "custom_title", "other"].includes(
-            allocation.purpose,
-          ) ||
-          !Number.isFinite(amount) ||
-          amount <= 0 ||
-          toCents(amount) !== amount * 100
-        ) {
-          return {
-            error:
-              "Check that every allocation has a valid purpose and amount.",
-          };
-        }
-
-        if (allocation.purpose === "membership") {
-          const feeCents = toCents(player.monthly_fee);
-
-          if (feeCents <= 0 || toCents(amount) % feeCents !== 0) {
-            return {
-              error: `Membership spending must be a complete number of monthly fees (${player.monthly_fee.toFixed(2)} each).`,
-            };
-          }
-        }
-
-        totalCents += toCents(amount);
-      }
-
-      if (totalCents > toCents(player.balance)) {
-        return { error: "Insufficient wallet balance." };
-      }
-
-      setSaving(true);
-
-      try {
-        const { data, error: spendError } = await supabase.rpc(
-          "record_wallet_spend",
-          {
-            p_player_id: values.player_id,
-            p_allocations: values.allocations.map((allocation) => ({
-              amount: allocation.amount,
-              purpose: allocation.purpose,
-              description: allocation.description?.trim() || null,
-            })),
-            p_request_id: requestId,
-          },
-        );
-
-        if (spendError) {
-          console.error("Failed to spend wallet balance:", spendError);
-          return {
-            error:
-              spendError.message ||
-              "Unable to spend wallet balance. Please try again.",
-          };
-        }
-
-        const result = data as WalletSpendResult;
-
-        if (
-          !result?.success ||
-          !result.player_id ||
-          !Array.isArray(result.allocations)
-        ) {
-          return {
-            error:
-              "The wallet spending could not be confirmed. Please refresh and check the history.",
-          };
-        }
-
-        await fetchWallets();
-
-        return { error: null, result };
-      } catch (spendError) {
-        console.error("Unexpected wallet spending error:", spendError);
-
-        return {
-          error:
-            "An unexpected error occurred while spending the wallet balance.",
-        };
-      } finally {
-        setSaving(false);
-      }
-    },
-    [user, players, fetchWallets],
-  );
-
-  const withdrawWalletBalance = useCallback(
-    async (
-      values: WalletWithdrawalFormValues,
-    ): Promise<{ error: string | null; result?: WalletWithdrawalResult }> => {
-      if (!user) {
-        return {
-          error: "Your session has expired. Please sign in again.",
-        };
-      }
-
-      const player = players.find(
-        (candidate) => candidate.id === values.player_id,
-      );
-
-      if (!player) {
-        return { error: "Player not found. Refresh and try again." };
-      }
-
-      const amount = Number(values.amount);
-
-      if (
-        !Number.isFinite(amount) ||
-        amount <= 0 ||
-        toCents(amount) !== amount * 100
-      ) {
-        return {
-          error: "Enter a valid amount with at most two decimal places.",
-        };
-      }
-
-      if (toCents(amount) > toCents(player.balance)) {
-        return { error: "Insufficient wallet balance." };
-      }
-
-      setSaving(true);
-
-      try {
-        const { data, error: withdrawalError } = await supabase.rpc(
-          "withdraw_player_wallet_balance",
-          {
-            p_player_id: values.player_id,
-            p_amount: amount,
-            p_description: values.description?.trim() || null,
-          },
-        );
-
-        if (withdrawalError) {
-          console.error("Failed to withdraw wallet balance:", withdrawalError);
-          return {
-            error:
-              withdrawalError.message ||
-              "Unable to withdraw wallet balance. Please try again.",
-          };
-        }
-
-        const result = data as WalletWithdrawalResult;
-
-        if (!result?.success || !result.transaction_id || !result.player_id) {
-          return {
-            error:
-              "The withdrawal could not be confirmed. Please refresh and check the wallet history.",
-          };
-        }
-
-        await fetchWallets();
-
-        return { error: null, result };
-      } catch (withdrawalError) {
-        console.error("Unexpected wallet withdrawal error:", withdrawalError);
-
-        return {
-          error:
-            "An unexpected error occurred while withdrawing the wallet balance.",
-        };
-      } finally {
-        setSaving(false);
-      }
-    },
-    [user, players, fetchWallets],
-  );
+  }, [user, serverId, workspaceLoading]);
 
   const fetchHistory = useCallback(
     async (playerId: string) => {
-      if (!user) {
+      historyPlayerIdRef.current = playerId;
+
+      const requestId = ++historyRequestRef.current;
+
+      if (workspaceLoading) return;
+
+      if (!user || !serverId) {
+        setTransactions([]);
+        setHistoryLoading(false);
+        return;
+      }
+
+      if (!players.some((player) => player.id === playerId)) {
         setTransactions([]);
         setHistoryLoading(false);
         return;
@@ -429,7 +129,7 @@ export function useWallets() {
           supabase
             .from("player_payment_allocations")
             .select("id, payment_id, player_id, amount, purpose, description")
-            .eq("owner_id", user.id)
+            .eq("server_id", serverId)
             .eq("player_id", playerId),
 
           supabase
@@ -437,7 +137,7 @@ export function useWallets() {
             .select(
               "id, transaction_type, amount, description, created_at, payment_id",
             )
-            .eq("owner_id", user.id)
+            .eq("server_id", serverId)
             .eq("player_id", playerId)
             .order("created_at", { ascending: false }),
         ]);
@@ -448,6 +148,27 @@ export function useWallets() {
         const allocations = allocationResult.data ?? [];
         const walletRows = walletResult.data ?? [];
 
+        const walletTransactionIds = walletRows.map((row) => row.id);
+        const reversedWalletTransactionIds = new Set<string>();
+
+        if (walletTransactionIds.length > 0) {
+          const { data: reversalEntries, error: reversalEntriesError } =
+            await supabase
+              .from("payment_reversal_entries")
+              .select("wallet_transaction_id")
+              .eq("server_id", serverId)
+              .eq("entry_type", "wallet_refund")
+              .in("wallet_transaction_id", walletTransactionIds);
+
+          if (reversalEntriesError) throw reversalEntriesError;
+
+          for (const entry of reversalEntries ?? []) {
+            if (entry.wallet_transaction_id) {
+              reversedWalletTransactionIds.add(entry.wallet_transaction_id);
+            }
+          }
+        }
+
         const paymentIds = [
           ...new Set(allocations.map((row) => row.payment_id)),
         ];
@@ -455,6 +176,7 @@ export function useWallets() {
         let payments: {
           id: string;
           payment_date: string;
+          created_at: string;
           player_id: string;
           amount: number;
           notes: string | null;
@@ -463,13 +185,42 @@ export function useWallets() {
         if (paymentIds.length > 0) {
           const { data, error: paymentsError } = await supabase
             .from("player_payments")
-            .select("id, payment_date, player_id, amount, notes")
-            .eq("owner_id", user.id)
+            .select("id, payment_date, created_at, player_id, amount, notes")
+            .eq("server_id", serverId)
             .in("id", paymentIds);
 
           if (paymentsError) throw paymentsError;
 
           payments = data ?? [];
+        }
+
+        const reversedAllocationIds = new Set<string>();
+        const reversedPaymentIds = new Set<string>();
+
+        if (paymentIds.length > 0) {
+          const { data: reversals, error: reversalsError } = await supabase
+            .from("payment_reversals")
+            .select("payment_id, reversal_type, allocation_id")
+            .eq("server_id", serverId)
+            .in("payment_id", paymentIds);
+
+          if (reversalsError) throw reversalsError;
+
+          for (const reversal of reversals ?? []) {
+            if (
+              reversal.reversal_type === "full_payment" &&
+              reversal.payment_id
+            ) {
+              reversedPaymentIds.add(reversal.payment_id);
+            }
+
+            if (
+              reversal.reversal_type === "payment_allocation" &&
+              reversal.allocation_id
+            ) {
+              reversedAllocationIds.add(reversal.allocation_id);
+            }
+          }
         }
 
         const payerIds = [
@@ -484,7 +235,7 @@ export function useWallets() {
           const { data, error: payerError } = await supabase
             .from("players")
             .select("id, minecraft_username")
-            .eq("owner_id", user.id)
+            .eq("server_id", serverId)
             .in("id", payerIds);
 
           if (payerError) throw payerError;
@@ -494,8 +245,14 @@ export function useWallets() {
           }
         }
 
+        if (requestId !== historyRequestRef.current) return;
+
         const paymentMap = new Map(
           payments.map((payment) => [payment.id, payment]),
+        );
+
+        const paymentCreatedAtMap = new Map(
+          payments.map((payment) => [payment.id, payment.created_at]),
         );
 
         const paymentEntries: WalletHistoryEntry[] = allocations.flatMap(
@@ -503,6 +260,13 @@ export function useWallets() {
             const payment = paymentMap.get(allocation.payment_id);
 
             if (!payment) return [];
+
+            const isAllocationReversed = reversedAllocationIds.has(
+              allocation.id,
+            );
+            const isPaymentReversed = reversedPaymentIds.has(
+              allocation.payment_id,
+            );
 
             return [
               {
@@ -515,6 +279,11 @@ export function useWallets() {
                 purpose: allocation.purpose,
                 payer_username:
                   payerNameMap.get(payment.player_id) ?? "Unknown payer",
+                allocation_id: allocation.id,
+                payment_id: allocation.payment_id,
+                is_allocation_reversed: isAllocationReversed,
+                is_payment_reversed: isPaymentReversed,
+                is_reversed: isAllocationReversed || isPaymentReversed,
               },
             ];
           },
@@ -527,26 +296,248 @@ export function useWallets() {
           amount: Number(row.amount),
           description: row.description,
           transaction_type: row.transaction_type,
+          wallet_transaction_id: row.id,
+          payment_id: row.payment_id,
+          is_reversed: reversedWalletTransactionIds.has(row.id),
         }));
 
+        if (requestId !== historyRequestRef.current) return;
+
         setTransactions(
-          [...paymentEntries, ...walletEntries].sort(
-            (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
-          ),
+          [...paymentEntries, ...walletEntries].sort((a, b) => {
+            const dateA =
+              a.kind === "payment" && a.payment_id
+                ? (paymentCreatedAtMap.get(a.payment_id) ?? a.date)
+                : a.date;
+
+            const dateB =
+              b.kind === "payment" && b.payment_id
+                ? (paymentCreatedAtMap.get(b.payment_id) ?? b.date)
+                : b.date;
+
+            return new Date(dateB).getTime() - new Date(dateA).getTime();
+          }),
         );
       } catch (historyError) {
+        if (requestId !== historyRequestRef.current) return;
+
         console.error("Failed to load wallet history:", historyError);
         setError("Unable to load wallet history. Please try again.");
       } finally {
-        setHistoryLoading(false);
+        if (requestId === historyRequestRef.current) {
+          setHistoryLoading(false);
+        }
       }
     },
-    [user],
+    [user, serverId, workspaceLoading, players],
+  );
+
+  fetchHistoryRef.current = fetchHistory;
+
+  const refreshAffectedHistory = useCallback(
+    async (affectedPlayerIds: string[]) => {
+      const openPlayerId = historyPlayerIdRef.current;
+
+      if (openPlayerId && affectedPlayerIds.includes(openPlayerId)) {
+        await fetchHistoryRef.current(openPlayerId);
+      }
+    },
+    [],
+  );
+
+  const {
+    recordPayment,
+    recordWalletSpend,
+    withdrawWalletBalance,
+  } = useWalletOperations({
+    hasUser: Boolean(user),
+    serverId,
+    workspaceLoading,
+    players,
+    fetchWallets,
+    refreshAffectedHistory,
+    setSaving,
+  });
+
+  const validateReversal = useCallback(
+    (reason: string): string | null => {
+      if (!user || !serverId || workspaceLoading) {
+        return "Select a workspace before reversing a transaction.";
+      }
+
+      if (!canReversePayments) {
+        return "You don't have permission to reverse payments.";
+      }
+
+      const trimmedReason = reason.trim();
+
+      if (trimmedReason.length < 3 || trimmedReason.length > 1000) {
+        return "The reversal reason must be 3–1000 characters.";
+      }
+
+      return null;
+    },
+    [user, serverId, workspaceLoading, canReversePayments],
+  );
+
+  const runReversal = useCallback(
+    async (
+      rpcName: "reverse_wallet_transaction" | "reverse_full_payment",
+      args: Record<string, string>,
+      playerId: string,
+      failureMessage: string,
+    ): Promise<{ error: string | null }> => {
+      setSaving(true);
+
+      try {
+        const { data, error: reversalError } = await supabase.rpc(
+          rpcName,
+          args,
+        );
+
+        if (reversalError) throw reversalError;
+
+        const result = data as ReversalResult;
+
+        if (!result?.success) {
+          return {
+            error:
+              "The reversal could not be confirmed. Refresh and check the history.",
+          };
+        }
+
+        await Promise.all([fetchWallets(), fetchHistory(playerId)]);
+
+        return { error: null };
+      } catch (reversalError) {
+        console.error(failureMessage, reversalError);
+
+        return {
+          error:
+            reversalError instanceof Error
+              ? reversalError.message
+              : failureMessage,
+        };
+      } finally {
+        setSaving(false);
+      }
+    },
+    [fetchWallets, fetchHistory],
+  );
+
+  const reverseWalletTransaction = useCallback(
+    async (
+      playerId: string,
+      transactionId: string,
+      reason: string,
+    ): Promise<{ error: string | null }> => {
+      const validationError = validateReversal(reason);
+      if (validationError) return { error: validationError };
+
+      const transaction = transactions.find(
+        (entry) => entry.wallet_transaction_id === transactionId,
+      );
+
+      if (
+        !transaction ||
+        transaction.kind !== "transaction" ||
+        transaction.transaction_type !== "wallet_spend" ||
+        transaction.amount >= 0 ||
+        transaction.payment_id != null ||
+        transaction.is_reversed
+      ) {
+        return {
+          error: "This wallet transaction is not eligible for reversal.",
+        };
+      }
+
+      return runReversal(
+        "reverse_wallet_transaction",
+        {
+          p_wallet_transaction_id: transactionId,
+          p_reason: reason.trim(),
+        },
+        playerId,
+        "Unable to reverse the wallet transaction.",
+      );
+    },
+    [transactions, validateReversal, runReversal],
+  );
+
+  const reverseFullPayment = useCallback(
+    async (
+      playerId: string,
+      paymentId: string,
+      reason: string,
+    ): Promise<{ error: string | null }> => {
+      const validationError = validateReversal(reason);
+      if (validationError) return { error: validationError };
+
+      const paymentAllocations = transactions.filter(
+        (entry) => entry.kind === "payment" && entry.payment_id === paymentId,
+      );
+
+      if (
+        paymentAllocations.length === 0 ||
+        paymentAllocations.some((entry) => entry.is_payment_reversed)
+      ) {
+        return {
+          error: "This payment is not eligible for full reversal.",
+        };
+      }
+
+      return runReversal(
+        "reverse_full_payment",
+        {
+          p_payment_id: paymentId,
+          p_reason: reason.trim(),
+        },
+        playerId,
+        "Unable to reverse the full payment.",
+      );
+    },
+    [transactions, validateReversal, runReversal],
   );
 
   useEffect(() => {
     void fetchWallets();
   }, [fetchWallets]);
+
+  useEffect(() => {
+    let active = true;
+
+    const checkPermission = async () => {
+      if (workspaceLoading || !user || !serverId) {
+        setCanReversePayments(false);
+        return;
+      }
+
+      const { data, error: permissionError } = await supabase.rpc(
+        "has_server_permission",
+        {
+          p_server_id: serverId,
+          p_permission_key: "payments.reverse",
+        },
+      );
+
+      if (!active) return;
+
+      setCanReversePayments(!permissionError && data === true);
+    };
+
+    void checkPermission();
+
+    return () => {
+      active = false;
+    };
+  }, [user, serverId, workspaceLoading]);
+
+  useEffect(() => {
+    historyRequestRef.current += 1;
+    historyPlayerIdRef.current = null;
+    setTransactions([]);
+    setHistoryLoading(false);
+  }, [serverId]);
 
   return {
     players,
@@ -554,11 +545,14 @@ export function useWallets() {
     loading,
     saving,
     historyLoading,
+    canReversePayments,
     error,
     fetchWallets,
     recordPayment,
     recordWalletSpend,
     withdrawWalletBalance,
     fetchHistory,
+    reverseWalletTransaction,
+    reverseFullPayment,
   };
 }

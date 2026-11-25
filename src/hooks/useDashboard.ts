@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase } from "../lib/supabase";
 
@@ -24,6 +25,8 @@ interface IncomeRow {
   id: string;
   player_id: string | null;
   source_type: string | null;
+  source_payment_allocation_id: string | null;
+  wallet_transaction_id: string | null;
   description: string | null;
   amount: number | string;
   income_date: string;
@@ -43,6 +46,19 @@ interface WalletSpendRow {
   amount: number | string;
   description: string | null;
   created_at: string;
+}
+
+interface PaymentReversalRow {
+  reversal_type: string;
+  payment_id: string | null;
+  allocation_id: string | null;
+  wallet_transaction_id: string | null;
+}
+
+interface PaymentReversalEntryRow {
+  entry_type: string;
+  income_transaction_id: string | null;
+  wallet_transaction_id: string | null;
 }
 
 const initialData: DashboardData = {
@@ -129,13 +145,15 @@ function consumeCount(counts: Map<string, number>, key: string | null) {
 }
 
 export function useDashboard() {
-  const { user } = useAuth();
+  const { user, activeWorkspace, workspaceLoading } = useAuth();
 
   const [data, setData] = useState<DashboardData>(initialData);
   const [selectedMonth, setSelectedMonth] = useState(getCurrentMonthKey);
   const [monthLabel, setMonthLabel] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const requestIdRef = useRef(0);
 
   const currentMonth = getCurrentMonthKey();
   const canGoNext = selectedMonth < currentMonth;
@@ -166,8 +184,15 @@ export function useDashboard() {
   };
 
   const fetchDashboard = useCallback(async () => {
-    if (!user) {
+    if (workspaceLoading) return;
+
+    const requestId = ++requestIdRef.current;
+    const serverId = activeWorkspace?.server_id;
+
+    if (!user || !serverId) {
       setData(initialData);
+      setMonthLabel("");
+      setError(null);
       setLoading(false);
       return;
     }
@@ -186,25 +211,27 @@ export function useDashboard() {
         expensesResult,
         membershipResult,
         walletSpendResult,
+        reversalsResult,
+        reversalEntriesResult,
       ] = await Promise.all([
         supabase
           .from("players")
           .select("id", { count: "exact", head: true })
-          .eq("owner_id", user.id),
+          .eq("server_id", serverId),
 
         supabase
           .from("players")
           .select("id", { count: "exact", head: true })
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .gte("joined_at", start)
           .lt("joined_at", end),
 
         supabase
           .from("income_transactions")
           .select(
-            "id, player_id, source_type, description, amount, income_date",
+            "id, player_id, source_type, source_payment_allocation_id, wallet_transaction_id, description, amount, income_date",
           )
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .gte("income_date", start)
           .lt("income_date", end)
           .order("income_date", { ascending: false }),
@@ -212,7 +239,7 @@ export function useDashboard() {
         supabase
           .from("expenses")
           .select("id, title, category, amount, expense_date")
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .gte("expense_date", start)
           .lt("expense_date", end)
           .order("expense_date", { ascending: false }),
@@ -220,18 +247,35 @@ export function useDashboard() {
         supabase
           .from("player_payment_allocations")
           .select("id, player_id, payment_id, amount, description")
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .eq("purpose", "membership"),
 
         supabase
           .from("wallet_transactions")
           .select("id, player_id, amount, description, created_at")
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .eq("transaction_type", "wallet_spend")
           .gte("created_at", startTimestamp)
           .lt("created_at", endTimestamp)
           .order("created_at", { ascending: false }),
+
+        supabase
+          .from("payment_reversals")
+          .select(
+            "reversal_type, payment_id, allocation_id, wallet_transaction_id",
+          )
+          .eq("server_id", serverId),
+
+        supabase
+          .from("payment_reversal_entries")
+          .select(
+            "entry_type, income_transaction_id, wallet_transaction_id",
+          )
+          .eq("server_id", serverId)
+          .eq("entry_type", "income_reversal"),
       ]);
+
+      if (requestId !== requestIdRef.current) return;
 
       const results = [
         playersResult,
@@ -240,6 +284,8 @@ export function useDashboard() {
         expensesResult,
         membershipResult,
         walletSpendResult,
+        reversalsResult,
+        reversalEntriesResult,
       ];
 
       const failedResult = results.find((result) => result.error);
@@ -248,16 +294,75 @@ export function useDashboard() {
         throw failedResult.error;
       }
 
-      const membershipAllocations = (membershipResult.data ??
+      const allMembershipAllocations = (membershipResult.data ??
         []) as MembershipAllocation[];
 
       const incomeRows = (incomeResult.data ?? []) as IncomeRow[];
-      const walletSpendRows = (walletSpendResult.data ??
+      const allWalletSpendRows = (walletSpendResult.data ??
         []) as WalletSpendRow[];
+
+      const reversalRows = (reversalsResult.data ??
+        []) as PaymentReversalRow[];
+
+      const reversalEntries = (reversalEntriesResult.data ??
+        []) as PaymentReversalEntryRow[];
 
       const expenseRows = expensesResult.data ?? [];
 
-      // Retrieve original cash payment dates for membership allocations.
+      // Build reversal lookup sets.
+      const reversedPaymentIds = new Set<string>();
+      const reversedAllocationIds = new Set<string>();
+      const reversedWalletTransactionIds = new Set<string>();
+      const reversedIncomeTransactionIds = new Set<string>();
+
+      for (const reversal of reversalRows) {
+        if (
+          reversal.reversal_type === "full_payment" &&
+          reversal.payment_id
+        ) {
+          reversedPaymentIds.add(reversal.payment_id);
+        }
+
+        if (
+          reversal.reversal_type === "payment_allocation" &&
+          reversal.allocation_id
+        ) {
+          reversedAllocationIds.add(reversal.allocation_id);
+        }
+
+        if (
+          reversal.reversal_type === "wallet_transaction" &&
+          reversal.wallet_transaction_id
+        ) {
+          reversedWalletTransactionIds.add(
+            reversal.wallet_transaction_id,
+          );
+        }
+      }
+
+      for (const entry of reversalEntries) {
+        if (entry.income_transaction_id) {
+          reversedIncomeTransactionIds.add(entry.income_transaction_id);
+        }
+
+        if (entry.wallet_transaction_id) {
+          reversedWalletTransactionIds.add(entry.wallet_transaction_id);
+        }
+      }
+
+      // Exclude reversed wallet spending before calculating legacy income.
+      const walletSpendRows = allWalletSpendRows.filter(
+        (item) => !reversedWalletTransactionIds.has(item.id),
+      );
+
+      // Exclude membership allocations reversed individually or through
+      // a full payment reversal.
+      const membershipAllocations = allMembershipAllocations.filter(
+        (allocation) =>
+          !reversedAllocationIds.has(allocation.id) &&
+          !reversedPaymentIds.has(allocation.payment_id),
+      );
+
       const paymentIds = [
         ...new Set(membershipAllocations.map((item) => item.payment_id)),
       ];
@@ -268,7 +373,7 @@ export function useDashboard() {
         const { data: payments, error: paymentsError } = await supabase
           .from("player_payments")
           .select("id, payment_date")
-          .eq("owner_id", user.id)
+          .eq("server_id", serverId)
           .gte("payment_date", start)
           .lt("payment_date", end)
           .in("id", paymentIds);
@@ -279,6 +384,8 @@ export function useDashboard() {
           (payments ?? []).map((payment) => [payment.id, payment]),
         );
       }
+
+      if (requestId !== requestIdRef.current) return;
 
       const datedMembershipAllocations = membershipAllocations.flatMap(
         (allocation) => {
@@ -295,8 +402,6 @@ export function useDashboard() {
         0,
       );
 
-      // Cash membership is counted from allocations. Remove matching
-      // membership income records so the same payment is not counted twice.
       const cashMembershipCounts = new Map<string, number>();
 
       for (const { allocation, payment } of datedMembershipAllocations) {
@@ -310,7 +415,44 @@ export function useDashboard() {
         );
       }
 
-      const filteredIncomeRows = incomeRows.filter((item) => {
+      // Remove income rows that have already been reversed, as well as
+      // rows linked to reversed allocations or wallet transactions.
+      const activeIncomeRows = incomeRows.filter((item) => {
+        if (reversedIncomeTransactionIds.has(item.id)) return false;
+
+        if (
+          item.source_payment_allocation_id &&
+          reversedAllocationIds.has(item.source_payment_allocation_id)
+        ) {
+          return false;
+        }
+
+        if (
+          item.wallet_transaction_id &&
+          reversedWalletTransactionIds.has(item.wallet_transaction_id)
+        ) {
+          return false;
+        }
+
+        const isMembership =
+          item.source_type?.trim().toLowerCase() === "membership";
+
+        if (
+          isMembership &&
+          item.source_payment_allocation_id &&
+          allMembershipAllocations.some(
+            (allocation) =>
+              allocation.id === item.source_payment_allocation_id &&
+              reversedPaymentIds.has(allocation.payment_id),
+          )
+        ) {
+          return false;
+        }
+
+        return true;
+      });
+
+      const filteredIncomeRows = activeIncomeRows.filter((item) => {
         const isMembership =
           item.source_type?.trim().toLowerCase() === "membership";
 
@@ -325,9 +467,6 @@ export function useDashboard() {
         return !consumeCount(cashMembershipCounts, key);
       });
 
-      // New wallet spending is already represented in income_transactions.
-      // Keep unmatched legacy wallet spending as a fallback, without
-      // adding wallet spending twice when an income record exists.
       const walletSpendCounts = new Map<string, number>();
 
       for (const item of walletSpendRows) {
@@ -446,6 +585,8 @@ export function useDashboard() {
         .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
         .slice(0, 5);
 
+      if (requestId !== requestIdRef.current) return;
+
       setData({
         totalPlayers: playersResult.count ?? 0,
         newPlayers: newPlayersResult.count ?? 0,
@@ -457,15 +598,23 @@ export function useDashboard() {
 
       setMonthLabel(label);
     } catch (err) {
+      if (requestId !== requestIdRef.current) return;
+
       console.error("Failed to load dashboard:", err);
       setError("Unable to load dashboard data. Please try again.");
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
-  }, [user, selectedMonth]);
+  }, [user, activeWorkspace?.server_id, workspaceLoading, selectedMonth]);
 
   useEffect(() => {
     void fetchDashboard();
+
+    return () => {
+      requestIdRef.current += 1;
+    };
   }, [fetchDashboard]);
 
   return {

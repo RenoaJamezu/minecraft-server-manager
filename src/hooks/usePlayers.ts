@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAuth } from "../contexts/AuthContext";
+import {
+  APPROVAL_SUBMITTED_MESSAGE,
+  submitApprovalIfRequired,
+} from "../lib/approval";
 import { supabase } from "../lib/supabase";
 import type {
   MembershipCoverageStatus,
@@ -130,46 +135,90 @@ function calculateMembershipCoverage(
 }
 
 export function usePlayers() {
-  const { user } = useAuth();
+  const { user, activeWorkspace, workspaceLoading } = useAuth();
 
   const [players, setPlayers] = useState<Player[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
+  const fetchRequestRef = useRef(0);
+
   const fetchPlayers = useCallback(async () => {
-    if (!user) {
+    const requestId = ++fetchRequestRef.current;
+
+    if (workspaceLoading) {
+      setLoading(true);
+      return;
+    }
+
+    if (!user || !activeWorkspace) {
       setPlayers([]);
       setLoading(false);
       return;
     }
 
+    const serverId = activeWorkspace.server_id;
+
     setLoading(true);
     setError("");
+    setPlayers([]);
 
-    const [playersResult, balancesResult, periodsResult] = await Promise.all([
+    const { data: playerData, error: playerError } = await supabase
+      .from("players")
+      .select(
+        "id, minecraft_username, discord_username, monthly_fee, status, joined_at, notes, titles, ban_reason, banned_at",
+      )
+      .eq("server_id", serverId)
+      .order("minecraft_username", { ascending: true });
+
+    if (requestId !== fetchRequestRef.current) return;
+
+    if (playerError) {
+      console.error("Failed to fetch players:", playerError);
+      setError("Unable to load players. Please try again.");
+      setPlayers([]);
+      setLoading(false);
+      return;
+    }
+
+    const fetchedPlayers = playerData ?? [];
+
+    if (fetchedPlayers.length === 0) {
+      setPlayers([]);
+      setLoading(false);
+      return;
+    }
+
+    const playerIds = fetchedPlayers.map((player) => player.id);
+
+    const [balancesResult, periodsResult] = await Promise.all([
       supabase
-        .from("players")
-        .select(
-          "id, minecraft_username, discord_username, monthly_fee, status, joined_at, notes, titles, ban_reason, banned_at",
-        )
-        .order("minecraft_username", { ascending: true }),
-
-      supabase.from("player_wallet_balances").select("player_id, balance"),
+        .from("player_wallet_balances")
+        .select("player_id, balance, server_id")
+        .eq("server_id", serverId)
+        .in("player_id", playerIds),
 
       supabase
         .from("membership_periods")
         .select("player_id, period_start, period_end")
-        .eq("owner_id", user.id)
+        .eq("server_id", serverId)
+        .in("player_id", playerIds)
+        .is("reversed_at", null)
         .order("period_end", { ascending: false }),
     ]);
 
-    const fetchError =
-      playersResult.error || balancesResult.error || periodsResult.error;
+    if (requestId !== fetchRequestRef.current) return;
 
-    if (fetchError) {
-      console.error("Failed to fetch player data:", fetchError);
-      setError("Unable to load players. Please try again.");
+    const secondaryError = balancesResult.error || periodsResult.error;
+
+    if (secondaryError) {
+      console.error("Failed to fetch player balances or membership periods:", {
+        balancesError: balancesResult.error,
+        periodsError: periodsResult.error,
+      });
+
+      setError("Unable to load complete player information. Please try again.");
       setPlayers([]);
       setLoading(false);
       return;
@@ -193,7 +242,7 @@ export function usePlayers() {
 
     const today = getLocalDateString();
 
-    const mappedPlayers: Player[] = (playersResult.data ?? []).map((player) => {
+    const mappedPlayers: Player[] = fetchedPlayers.map((player) => {
       const periods = periodsByPlayer.get(player.id) ?? [];
       const coverage = calculateMembershipCoverage(periods, today);
 
@@ -208,7 +257,7 @@ export function usePlayers() {
 
     setPlayers(mappedPlayers);
     setLoading(false);
-  }, [user]);
+  }, [user, activeWorkspace, workspaceLoading]);
 
   useEffect(() => {
     void fetchPlayers();
@@ -233,53 +282,89 @@ export function usePlayers() {
       return "Your session has expired. Please sign in again.";
     }
 
-    if (values.is_banned && !values.ban_reason.trim()) {
-      return "Please provide a reason for the ban.";
+    if (workspaceLoading || !activeWorkspace) {
+      return "No active workspace selected. Please try again.";
     }
 
-    const titles = normalizePlayerTitles(values.titles);
-    const isBanned = values.is_banned;
+    if (
+      editingPlayer &&
+      !players.some((player) => player.id === editingPlayer.id)
+    ) {
+      return "This player does not belong to the active workspace.";
+    }
 
-    const bannedAt = isBanned
-      ? (editingPlayer?.banned_at ?? new Date().toISOString())
-      : null;
+    const serverId = activeWorkspace.server_id;
 
     const payload = {
       minecraft_username: username,
       discord_username: values.discord_username.trim() || null,
       monthly_fee: monthlyFee,
-      status: values.status,
       joined_at: values.joined_at,
       notes: values.notes.trim() || null,
-      titles,
-      ban_reason: isBanned ? values.ban_reason.trim() : null,
-      banned_at: bannedAt,
+      titles: normalizePlayerTitles(values.titles),
     };
 
     setSaving(true);
 
-    const result = editingPlayer
-      ? await supabase
+    try {
+      const submitted = await submitApprovalIfRequired({
+        serverId,
+        requestType: editingPlayer ? "player.update" : "player.create",
+        payload: editingPlayer
+          ? {
+              ...payload,
+              player_id: editingPlayer.id,
+            }
+          : payload,
+      });
+
+      if (submitted) {
+        return APPROVAL_SUBMITTED_MESSAGE;
+      }
+
+      if (editingPlayer) {
+        const { error: updateError } = await supabase
           .from("players")
           .update(payload)
           .eq("id", editingPlayer.id)
-      : await supabase
-          .from("players")
-          .insert({ ...payload, owner_id: user.id });
+          .eq("server_id", serverId);
 
-    setSaving(false);
+        if (updateError) {
+          console.error("Failed to update player:", updateError);
 
-    if (result.error) {
-      console.error("Failed to save player:", result.error);
+          await fetchPlayers();
 
-      return result.error.code === "23505"
-        ? "That Minecraft username already exists."
-        : "Unable to save player. Please check your details and try again.";
+          return updateError.code === "23505"
+            ? "That Minecraft username already exists."
+            : "Unable to update player details. Please try again.";
+        }
+      } else {
+        const { error: insertError } = await supabase.from("players").insert({
+          ...payload,
+          status: "active",
+          owner_id: activeWorkspace.owner_id,
+          server_id: serverId,
+        });
+
+        if (insertError) {
+          console.error("Failed to create player:", insertError);
+
+          return insertError.code === "23505"
+            ? "That Minecraft username already exists."
+            : "Unable to create player. Please check your permissions and try again.";
+        }
+      }
+
+      await fetchPlayers();
+
+      return null;
+    } catch (saveError) {
+      console.error("Unexpected error saving player:", saveError);
+
+      return "An unexpected error occurred. Please try again.";
+    } finally {
+      setSaving(false);
     }
-
-    await fetchPlayers();
-
-    return null;
   };
 
   return {

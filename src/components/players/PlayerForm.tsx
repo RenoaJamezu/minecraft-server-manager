@@ -3,7 +3,6 @@ import { Plus, X } from "lucide-react";
 import {
   PLAYER_BUILT_IN_TITLES,
   type PlayerFormValues,
-  type PlayerStatus,
 } from "../../types/player";
 
 interface PlayerFormProps {
@@ -148,28 +147,6 @@ export default function PlayerForm({ form, onChange }: PlayerFormProps) {
             className={inputClass}
           />
         </div>
-      </div>
-
-      <div>
-        <label htmlFor="status" className={labelClass}>
-          Membership status
-        </label>
-
-        <select
-          id="status"
-          value={form.status}
-          onChange={(event) =>
-            updateField("status", event.target.value as PlayerStatus)
-          }
-          className={inputClass}
-        >
-          <option value="active">Active</option>
-          <option value="inactive">Inactive</option>
-        </select>
-
-        <p className="mt-1 text-xs text-zinc-500">
-          This is separate from the player's ban and membership coverage status.
-        </p>
       </div>
 
       {/* Player titles */}

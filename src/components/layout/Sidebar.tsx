@@ -5,25 +5,87 @@ import {
   Wallet,
   ArrowLeftRight,
   Receipt,
-  Settings,
   Gamepad2,
+  UserCog,
+  ScrollText,
+  ClipboardCheck,
   X,
 } from "lucide-react";
+import { useAuth, type PermissionKey } from "../../contexts/AuthContext";
 
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
 }
 
-const navigation = [
-  { label: "Dashboard", icon: LayoutDashboard, href: "/" },
-  { label: "Players", icon: Users, href: "/players" },
-  { label: "Wallets", icon: Wallet, href: "/wallets" },
-  { label: "Transactions", icon: ArrowLeftRight, href: "/transactions" },
-  { label: "Expenses", icon: Receipt, href: "/expenses" },
+const navigation: {
+  label: string;
+  icon: typeof LayoutDashboard;
+  href: string;
+  permission?: PermissionKey;
+  ownerOnly?: boolean;
+}[] = [
+  {
+    label: "Dashboard",
+    icon: LayoutDashboard,
+    href: "/",
+    permission: "dashboard.view",
+  },
+  {
+    label: "Players",
+    icon: Users,
+    href: "/players",
+    permission: "players.view",
+  },
+  {
+    label: "Wallets",
+    icon: Wallet,
+    href: "/wallets",
+    permission: "wallets.view",
+  },
+  {
+    label: "Transactions",
+    icon: ArrowLeftRight,
+    href: "/transactions",
+    permission: "payments.view",
+  },
+  {
+    label: "Expenses",
+    icon: Receipt,
+    href: "/expenses",
+    permission: "expenses.view",
+  },
+  {
+    label: "Approvals",
+    icon: ClipboardCheck,
+    href: "/approvals",
+    permission: "staff.view",
+  },
+  {
+    label: "Staff",
+    icon: UserCog,
+    href: "/staff",
+    permission: "staff.view",
+  },
+  {
+    label: "Audit Logs",
+    icon: ScrollText,
+    href: "/audit-logs",
+    ownerOnly: true,
+  },
 ];
 
 export default function Sidebar({ open, onClose }: SidebarProps) {
+  const { hasPermission, permissionsLoading, activeWorkspace } = useAuth();
+
+  const visibleNavigation = navigation.filter((item) => {
+    if (item.ownerOnly) {
+      return activeWorkspace?.is_owner === true;
+    }
+
+    return item.permission ? hasPermission(item.permission) : false;
+  });
+
   return (
     <>
       {open && (
@@ -64,46 +126,30 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
             Management
           </p>
 
-          {navigation.map((item) => {
-            const Icon = item.icon;
+          {!permissionsLoading &&
+            visibleNavigation.map((item) => {
+              const Icon = item.icon;
 
-            return (
-              <NavLink
-                key={item.label}
-                to={item.href}
-                end={item.href === "/"}
-                onClick={onClose}
-                className={({ isActive }) =>
-                  `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition ${
-                    isActive
-                      ? "bg-emerald-500/10 font-medium text-emerald-400"
-                      : "text-zinc-400 hover:bg-white/[0.04] hover:text-white"
-                  }`
-                }
-              >
-                <Icon size={18} />
-                {item.label}
-              </NavLink>
-            );
-          })}
+              return (
+                <NavLink
+                  key={item.label}
+                  to={item.href}
+                  end={item.href === "/"}
+                  onClick={onClose}
+                  className={({ isActive }) =>
+                    `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition ${
+                      isActive
+                        ? "bg-emerald-500/10 font-medium text-emerald-400"
+                        : "text-zinc-400 hover:bg-white/[0.04] hover:text-white"
+                    }`
+                  }
+                >
+                  <Icon size={18} />
+                  {item.label}
+                </NavLink>
+              );
+            })}
         </nav>
-
-        <div className="border-t border-white/[0.06] p-3">
-          <NavLink
-            to="/settings"
-            onClick={onClose}
-            className={({ isActive }) =>
-              `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${
-                isActive
-                  ? "bg-emerald-500/10 font-medium text-emerald-400"
-                  : "text-zinc-400 hover:bg-white/[0.04] hover:text-white"
-              }`
-            }
-          >
-            <Settings size={18} />
-            Settings
-          </NavLink>
-        </div>
       </aside>
     </>
   );

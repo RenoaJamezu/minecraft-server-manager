@@ -5,6 +5,7 @@ import ExpenseStats from "../components/expenses/ExpenseStats";
 import ExpenseTable from "../components/expenses/ExpenseTable";
 import ExpenseToolbar from "../components/expenses/ExpenseToolbar";
 import { useExpenses } from "../hooks/useExpenses";
+import { APPROVAL_SUBMITTED_MESSAGE } from "../lib/approval";
 import {
   createEmptyExpenseForm,
   type Expense,
@@ -27,6 +28,7 @@ export default function Expenses() {
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
   const [form, setForm] = useState<ExpenseFormValues>(createEmptyExpenseForm());
   const [dialogError, setDialogError] = useState("");
+  const [notice, setNotice] = useState("");
 
   const filteredExpenses = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -45,6 +47,7 @@ export default function Expenses() {
     setEditingExpense(null);
     setForm(createEmptyExpenseForm());
     setDialogError("");
+    setNotice("");
     setShowDialog(true);
   }
 
@@ -58,6 +61,7 @@ export default function Expenses() {
       notes: expense.notes ?? "",
     });
     setDialogError("");
+    setNotice("");
     setShowDialog(true);
   }
 
@@ -72,8 +76,21 @@ export default function Expenses() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setDialogError("");
+    setNotice("");
 
     const saveError = await saveExpense(form, editingExpense);
+
+    if (saveError === APPROVAL_SUBMITTED_MESSAGE) {
+      setShowDialog(false);
+      setEditingExpense(null);
+      setForm(createEmptyExpenseForm());
+      setNotice(
+        editingExpense
+          ? "Expense changes submitted for approval. No changes have been applied yet."
+          : "Expense creation submitted for approval. It will appear after approval.",
+      );
+      return;
+    }
 
     if (saveError) {
       setDialogError(saveError);
@@ -115,6 +132,15 @@ export default function Expenses() {
           Add Expense
         </button>
       </div>
+
+      {notice && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+        >
+          {notice}
+        </div>
+      )}
 
       {error && (
         <div className="flex items-center justify-between gap-3 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-300">

@@ -5,6 +5,7 @@ import PlayerStats from "../components/players/PlayerStats";
 import PlayerTable from "../components/players/PlayerTable";
 import PlayerToolbar from "../components/players/PlayerToolbar";
 import { usePlayers } from "../hooks/usePlayers";
+import { APPROVAL_SUBMITTED_MESSAGE } from "../lib/approval";
 import {
   isPlayerActive,
   isPlayerBanned,
@@ -22,6 +23,7 @@ export default function Players() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingPlayer, setEditingPlayer] = useState<Player | null>(null);
   const [dialogError, setDialogError] = useState("");
+  const [notice, setNotice] = useState("");
 
   const filteredPlayers = players
     .filter((player) => {
@@ -53,12 +55,14 @@ export default function Players() {
   function openCreateDialog() {
     setEditingPlayer(null);
     setDialogError("");
+    setNotice("");
     setDialogOpen(true);
   }
 
   function openEditDialog(player: Player) {
     setEditingPlayer(player);
     setDialogError("");
+    setNotice("");
     setDialogOpen(true);
   }
 
@@ -72,8 +76,20 @@ export default function Players() {
 
   async function handleSubmit(values: PlayerFormValues) {
     setDialogError("");
+    setNotice("");
 
     const saveError = await savePlayer(values, editingPlayer);
+
+    if (saveError === APPROVAL_SUBMITTED_MESSAGE) {
+      setDialogOpen(false);
+      setEditingPlayer(null);
+      setNotice(
+        editingPlayer
+          ? "Player changes submitted for approval. No changes have been applied yet."
+          : "Player creation submitted for approval. The player will appear after approval.",
+      );
+      return;
+    }
 
     if (saveError) {
       setDialogError(saveError);
@@ -106,6 +122,15 @@ export default function Players() {
           Add player
         </button>
       </div>
+
+      {notice && (
+        <div
+          role="status"
+          className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-300"
+        >
+          {notice}
+        </div>
+      )}
 
       <PlayerStats players={players} />
 
