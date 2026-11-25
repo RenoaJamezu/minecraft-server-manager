@@ -1,5 +1,6 @@
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase } from "../lib/supabase";
 import type { Transaction } from "../types/transaction";
@@ -17,6 +18,11 @@ interface Reversal {
 interface ReversalInfo {
   reversedAt: string | null;
   reason: string | null;
+}
+
+interface DatedTransaction {
+  transaction: Transaction;
+  createdAt: string;
 }
 
 function getMatchKey(
@@ -51,11 +57,6 @@ function consumeCount(counts: Map<string, number>, key: string | null) {
   return true;
 }
 
-interface DatedTransaction {
-  transaction: Transaction;
-  createdAt: string;
-}
-
 function toReversalInfo(reversal?: Reversal): ReversalInfo | null {
   if (!reversal) return null;
 
@@ -65,352 +66,370 @@ function toReversalInfo(reversal?: Reversal): ReversalInfo | null {
   };
 }
 
+async function fetchTransactionsData(
+  serverId: string,
+): Promise<Transaction[]> {
+  const [
+    incomeResult,
+    expenseResult,
+    membershipResult,
+    reversalsResult,
+    reversalEntriesResult,
+  ] = await Promise.all([
+    supabase
+      .from("income_transactions")
+      .select(
+        "id, player_id, source_type, source_payment_allocation_id, description, amount, income_date, created_at, wallet_transaction_id",
+      )
+      .eq("server_id", serverId)
+      .order("income_date", { ascending: false })
+      .order("created_at", { ascending: false }),
+
+    supabase
+      .from("expenses")
+      .select("id, title, category, amount, expense_date, created_at")
+      .eq("server_id", serverId)
+      .order("expense_date", { ascending: false })
+      .order("created_at", { ascending: false }),
+
+    supabase
+      .from("player_payment_allocations")
+      .select("id, player_id, payment_id, amount, purpose, description")
+      .eq("server_id", serverId)
+      .eq("purpose", "membership"),
+
+    supabase
+      .from("payment_reversals")
+      .select(
+        "id, reversal_type, payment_id, allocation_id, wallet_transaction_id, reversed_at, reason",
+      )
+      .eq("server_id", serverId),
+
+    supabase
+      .from("payment_reversal_entries")
+      .select("reversal_id, income_transaction_id, entry_type")
+      .eq("server_id", serverId)
+      .eq("entry_type", "income_reversal"),
+  ]);
+
+  if (incomeResult.error) throw incomeResult.error;
+  if (expenseResult.error) throw expenseResult.error;
+  if (membershipResult.error) throw membershipResult.error;
+  if (reversalsResult.error) throw reversalsResult.error;
+  if (reversalEntriesResult.error) throw reversalEntriesResult.error;
+
+  const incomeRows = incomeResult.data ?? [];
+  const membershipAllocations = membershipResult.data ?? [];
+  const expenseRows = expenseResult.data ?? [];
+  const reversals = (reversalsResult.data ?? []) as Reversal[];
+  const reversalEntries = reversalEntriesResult.data ?? [];
+
+  const reversalById = new Map(
+    reversals.map((reversal) => [reversal.id, reversal]),
+  );
+
+  const reversalByPaymentId = new Map<string, Reversal>();
+  const reversalByAllocationId = new Map<string, Reversal>();
+  const reversalByWalletTransactionId = new Map<string, Reversal>();
+
+  for (const reversal of reversals) {
+    if (reversal.reversal_type === "full_payment" && reversal.payment_id) {
+      reversalByPaymentId.set(reversal.payment_id, reversal);
+    }
+
+    if (
+      reversal.reversal_type === "payment_allocation" &&
+      reversal.allocation_id
+    ) {
+      reversalByAllocationId.set(reversal.allocation_id, reversal);
+    }
+
+    if (
+      reversal.reversal_type === "wallet_transaction" &&
+      reversal.wallet_transaction_id
+    ) {
+      reversalByWalletTransactionId.set(
+        reversal.wallet_transaction_id,
+        reversal,
+      );
+    }
+  }
+
+  const reversalByIncomeTransactionId = new Map<string, Reversal>();
+
+  for (const entry of reversalEntries) {
+    if (!entry.income_transaction_id || !entry.reversal_id) continue;
+
+    const reversal = reversalById.get(entry.reversal_id);
+
+    if (reversal) {
+      reversalByIncomeTransactionId.set(
+        entry.income_transaction_id,
+        reversal,
+      );
+    }
+  }
+
+  // Retrieve original cash payment dates and recording timestamps.
+  const paymentIds = [
+    ...new Set(membershipAllocations.map((item) => item.payment_id)),
+  ];
+
+  let paymentMap = new Map<
+    string,
+    { id: string; payment_date: string; created_at: string }
+  >();
+
+  if (paymentIds.length > 0) {
+    const { data, error: paymentsError } = await supabase
+      .from("player_payments")
+      .select("id, payment_date, created_at")
+      .eq("server_id", serverId)
+      .in("id", paymentIds);
+
+    if (paymentsError) throw paymentsError;
+
+    paymentMap = new Map(
+      (data ?? []).map((payment) => [payment.id, payment]),
+    );
+  }
+
+  const datedMembershipAllocations = membershipAllocations.flatMap(
+    (allocation) => {
+      const payment = paymentMap.get(allocation.payment_id);
+
+      if (!payment) return [];
+
+      const reversal =
+        reversalByAllocationId.get(allocation.id) ??
+        reversalByPaymentId.get(allocation.payment_id);
+
+      return [{ allocation, payment, reversal }];
+    },
+  );
+
+  // Prevent cash membership payments from appearing twice.
+  const cashMembershipCounts = new Map<string, number>();
+
+  for (const { allocation, payment } of datedMembershipAllocations) {
+    incrementCount(
+      cashMembershipCounts,
+      getMatchKey(
+        allocation.player_id,
+        allocation.amount,
+        payment.payment_date,
+      ),
+    );
+  }
+
+  const filteredIncomeRows = incomeRows.filter((item) => {
+    if (item.wallet_transaction_id) {
+      return true;
+    }
+
+    if (item.source_type?.trim().toLowerCase() !== "membership") {
+      return true;
+    }
+
+    return !consumeCount(
+      cashMembershipCounts,
+      getMatchKey(item.player_id, item.amount, item.income_date),
+    );
+  });
+
+  // Collect all associated player IDs.
+  const playerIds = [
+    ...new Set(
+      [
+        ...filteredIncomeRows.map((item) => item.player_id),
+        ...datedMembershipAllocations.map(
+          ({ allocation }) => allocation.player_id,
+        ),
+      ].filter((id): id is string => Boolean(id)),
+    ),
+  ];
+
+  let playerMap = new Map<string, string>();
+
+  if (playerIds.length > 0) {
+    const { data: players, error: playersError } = await supabase
+      .from("players")
+      .select("id, minecraft_username")
+      .eq("server_id", serverId)
+      .in("id", playerIds);
+
+    if (playersError) throw playersError;
+
+    playerMap = new Map(
+      (players ?? []).map((player) => [
+        player.id,
+        player.minecraft_username,
+      ]),
+    );
+  }
+
+  // Custom title, other, and wallet-funded membership income.
+  const income: DatedTransaction[] = filteredIncomeRows.map((item) => {
+    const reversal =
+      reversalByIncomeTransactionId.get(item.id) ??
+      (item.source_payment_allocation_id
+        ? reversalByAllocationId.get(item.source_payment_allocation_id)
+        : undefined) ??
+      (item.wallet_transaction_id
+        ? reversalByWalletTransactionId.get(item.wallet_transaction_id)
+        : undefined);
+
+    const reversalInfo = toReversalInfo(reversal);
+
+    return {
+      transaction: {
+        id: `income-${item.id}`,
+        player: item.player_id
+          ? (playerMap.get(item.player_id) ?? null)
+          : null,
+        description: item.description || "Income",
+        category: item.wallet_transaction_id
+          ? "Wallet Spend"
+          : item.source_type || "Other",
+        date: item.income_date,
+        amount: Number(item.amount || 0),
+        kind: "income",
+        isReversed: Boolean(reversalInfo),
+        reversedAt: reversalInfo?.reversedAt,
+        reversalReason: reversalInfo?.reason,
+      },
+      createdAt: item.created_at,
+    };
+  });
+
+  // Cash membership payments are sourced from allocations.
+  const membershipIncome: DatedTransaction[] =
+    datedMembershipAllocations.map(({ allocation, payment, reversal }) => {
+      const reversalInfo = toReversalInfo(reversal);
+
+      return {
+        transaction: {
+          id: `membership-${allocation.id}`,
+          player: playerMap.get(allocation.player_id) ?? null,
+          description: allocation.description || "Membership payment",
+          category: "Membership",
+          date: payment.payment_date,
+          amount: Number(allocation.amount || 0),
+          kind: "income",
+          isReversed: Boolean(reversalInfo),
+          reversedAt: reversalInfo?.reversedAt,
+          reversalReason: reversalInfo?.reason,
+        },
+        createdAt: payment.created_at,
+      };
+    });
+
+  const expenses: DatedTransaction[] = expenseRows.map((item) => ({
+    transaction: {
+      id: `expense-${item.id}`,
+      player: null,
+      description: item.title,
+      category: item.category || "Other",
+      date: item.expense_date,
+      amount: Number(item.amount || 0),
+      kind: "expense",
+    },
+    createdAt: item.created_at,
+  }));
+
+  // Sort by transaction date, then recording timestamp, then ID.
+  const combined = [...income, ...membershipIncome, ...expenses].sort(
+    (a, b) => {
+      const dateComparison = b.transaction.date.localeCompare(
+        a.transaction.date,
+      );
+
+      if (dateComparison !== 0) return dateComparison;
+
+      const timestampComparison =
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+
+      if (timestampComparison !== 0) return timestampComparison;
+
+      return b.transaction.id.localeCompare(a.transaction.id);
+    },
+  );
+
+  return combined.map((item) => item.transaction);
+}
+
+const TRANSACTION_TABLES = [
+  "income_transactions",
+  "expenses",
+  "player_payment_allocations",
+  "payment_reversals",
+  "payment_reversal_entries",
+  "player_payments",
+  "wallet_transactions",
+  "players",
+] as const;
+
 export function useTransactions() {
   const { user, activeWorkspace, workspaceLoading } = useAuth();
+  const queryClient = useQueryClient();
 
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const serverId = activeWorkspace?.server_id ?? null;
+  const enabled = Boolean(user && serverId && !workspaceLoading);
 
-  const fetchRequestRef = useRef(0);
+  const queryKey = ["transactions", serverId] as const;
+
+  const transactionsQuery = useQuery({
+    queryKey,
+    queryFn: () => fetchTransactionsData(serverId!),
+    enabled,
+  });
+
+  const transactions = transactionsQuery.data ?? [];
+
+  // Subscribe to every table used to construct the transaction list.
+  useEffect(() => {
+    if (!enabled || !serverId) return;
+
+    const channel = supabase.channel(`transactions-${serverId}`);
+
+    for (const table of TRANSACTION_TABLES) {
+      channel.on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table,
+          filter: `server_id=eq.${serverId}`,
+        },
+        () => {
+          void queryClient.invalidateQueries({
+            queryKey: ["transactions", serverId],
+          });
+        },
+      );
+    }
+
+    channel.subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [enabled, serverId, queryClient]);
+
+  const { refetch } = transactionsQuery;
 
   const fetchTransactions = useCallback(async () => {
-    const requestId = ++fetchRequestRef.current;
+    if (!enabled || !serverId) return;
 
-    if (workspaceLoading) {
-      setLoading(true);
-      return;
-    }
-
-    if (!user || !activeWorkspace) {
-      setTransactions([]);
-      setLoading(false);
-      return;
-    }
-
-    const serverId = activeWorkspace.server_id;
-
-    setLoading(true);
-    setError("");
-    setTransactions([]);
-
-    try {
-      const [
-        incomeResult,
-        expenseResult,
-        membershipResult,
-        reversalsResult,
-        reversalEntriesResult,
-      ] = await Promise.all([
-        supabase
-          .from("income_transactions")
-          .select(
-            "id, player_id, source_type, source_payment_allocation_id, description, amount, income_date, created_at, wallet_transaction_id",
-          )
-          .eq("server_id", serverId)
-          .order("income_date", { ascending: false })
-          .order("created_at", { ascending: false }),
-
-        supabase
-          .from("expenses")
-          .select("id, title, category, amount, expense_date, created_at")
-          .eq("server_id", serverId)
-          .order("expense_date", { ascending: false })
-          .order("created_at", { ascending: false }),
-
-        supabase
-          .from("player_payment_allocations")
-          .select("id, player_id, payment_id, amount, purpose, description")
-          .eq("server_id", serverId)
-          .eq("purpose", "membership"),
-
-        supabase
-          .from("payment_reversals")
-          .select(
-            "id, reversal_type, payment_id, allocation_id, wallet_transaction_id, reversed_at, reason",
-          )
-          .eq("server_id", serverId),
-
-        supabase
-          .from("payment_reversal_entries")
-          .select("reversal_id, income_transaction_id, entry_type")
-          .eq("server_id", serverId)
-          .eq("entry_type", "income_reversal"),
-      ]);
-
-      if (requestId !== fetchRequestRef.current) return;
-
-      if (incomeResult.error) throw incomeResult.error;
-      if (expenseResult.error) throw expenseResult.error;
-      if (membershipResult.error) throw membershipResult.error;
-      if (reversalsResult.error) throw reversalsResult.error;
-      if (reversalEntriesResult.error) throw reversalEntriesResult.error;
-
-      const incomeRows = incomeResult.data ?? [];
-      const membershipAllocations = membershipResult.data ?? [];
-      const expenseRows = expenseResult.data ?? [];
-      const reversals = (reversalsResult.data ?? []) as Reversal[];
-      const reversalEntries = reversalEntriesResult.data ?? [];
-
-      const reversalById = new Map(
-        reversals.map((reversal) => [reversal.id, reversal]),
-      );
-
-      const reversalByPaymentId = new Map<string, Reversal>();
-      const reversalByAllocationId = new Map<string, Reversal>();
-      const reversalByWalletTransactionId = new Map<string, Reversal>();
-
-      for (const reversal of reversals) {
-        if (reversal.reversal_type === "full_payment" && reversal.payment_id) {
-          reversalByPaymentId.set(reversal.payment_id, reversal);
-        }
-
-        if (
-          reversal.reversal_type === "payment_allocation" &&
-          reversal.allocation_id
-        ) {
-          reversalByAllocationId.set(reversal.allocation_id, reversal);
-        }
-
-        if (
-          reversal.reversal_type === "wallet_transaction" &&
-          reversal.wallet_transaction_id
-        ) {
-          reversalByWalletTransactionId.set(
-            reversal.wallet_transaction_id,
-            reversal,
-          );
-        }
-      }
-
-      const reversalByIncomeTransactionId = new Map<string, Reversal>();
-
-      for (const entry of reversalEntries) {
-        if (!entry.income_transaction_id || !entry.reversal_id) continue;
-
-        const reversal = reversalById.get(entry.reversal_id);
-
-        if (reversal) {
-          reversalByIncomeTransactionId.set(
-            entry.income_transaction_id,
-            reversal,
-          );
-        }
-      }
-
-      // Retrieve original cash payment dates and recording timestamps.
-      const paymentIds = [
-        ...new Set(membershipAllocations.map((item) => item.payment_id)),
-      ];
-
-      let paymentMap = new Map<
-        string,
-        { id: string; payment_date: string; created_at: string }
-      >();
-
-      if (paymentIds.length > 0) {
-        const { data, error: paymentsError } = await supabase
-          .from("player_payments")
-          .select("id, payment_date, created_at")
-          .eq("server_id", serverId)
-          .in("id", paymentIds);
-
-        if (paymentsError) throw paymentsError;
-
-        paymentMap = new Map(
-          (data ?? []).map((payment) => [payment.id, payment]),
-        );
-      }
-
-      if (requestId !== fetchRequestRef.current) return;
-
-      const datedMembershipAllocations = membershipAllocations.flatMap(
-        (allocation) => {
-          const payment = paymentMap.get(allocation.payment_id);
-
-          if (!payment) return [];
-
-          const reversal =
-            reversalByAllocationId.get(allocation.id) ??
-            reversalByPaymentId.get(allocation.payment_id);
-
-          return [{ allocation, payment, reversal }];
-        },
-      );
-
-      // Prevent cash membership payments from appearing twice.
-      const cashMembershipCounts = new Map<string, number>();
-
-      for (const { allocation, payment } of datedMembershipAllocations) {
-        incrementCount(
-          cashMembershipCounts,
-          getMatchKey(
-            allocation.player_id,
-            allocation.amount,
-            payment.payment_date,
-          ),
-        );
-      }
-
-      const filteredIncomeRows = incomeRows.filter((item) => {
-        if (item.wallet_transaction_id) {
-          return true;
-        }
-
-        if (item.source_type?.trim().toLowerCase() !== "membership") {
-          return true;
-        }
-
-        return !consumeCount(
-          cashMembershipCounts,
-          getMatchKey(item.player_id, item.amount, item.income_date),
-        );
-      });
-
-      // Collect all associated player IDs.
-      const playerIds = [
-        ...new Set(
-          [
-            ...filteredIncomeRows.map((item) => item.player_id),
-            ...datedMembershipAllocations.map(
-              ({ allocation }) => allocation.player_id,
-            ),
-          ].filter((id): id is string => Boolean(id)),
-        ),
-      ];
-
-      let playerMap = new Map<string, string>();
-
-      if (playerIds.length > 0) {
-        const { data: players, error: playersError } = await supabase
-          .from("players")
-          .select("id, minecraft_username")
-          .eq("server_id", serverId)
-          .in("id", playerIds);
-
-        if (playersError) throw playersError;
-
-        playerMap = new Map(
-          (players ?? []).map((player) => [
-            player.id,
-            player.minecraft_username,
-          ]),
-        );
-      }
-
-      if (requestId !== fetchRequestRef.current) return;
-
-      // Custom title, other, and wallet-funded membership income.
-      const income: DatedTransaction[] = filteredIncomeRows.map((item) => {
-        const reversal =
-          reversalByIncomeTransactionId.get(item.id) ??
-          (item.source_payment_allocation_id
-            ? reversalByAllocationId.get(item.source_payment_allocation_id)
-            : undefined) ??
-          (item.wallet_transaction_id
-            ? reversalByWalletTransactionId.get(item.wallet_transaction_id)
-            : undefined);
-
-        const reversalInfo = toReversalInfo(reversal);
-
-        return {
-          transaction: {
-            id: `income-${item.id}`,
-            player: item.player_id
-              ? (playerMap.get(item.player_id) ?? null)
-              : null,
-            description: item.description || "Income",
-            category: item.wallet_transaction_id
-              ? "Wallet Spend"
-              : item.source_type || "Other",
-            date: item.income_date,
-            amount: Number(item.amount || 0),
-            kind: "income",
-            isReversed: Boolean(reversalInfo),
-            reversedAt: reversalInfo?.reversedAt,
-            reversalReason: reversalInfo?.reason,
-          },
-          createdAt: item.created_at,
-        };
-      });
-
-      // Cash membership payments are sourced from allocations.
-      const membershipIncome: DatedTransaction[] =
-        datedMembershipAllocations.map(
-          ({ allocation, payment, reversal }) => {
-            const reversalInfo = toReversalInfo(reversal);
-
-            return {
-              transaction: {
-                id: `membership-${allocation.id}`,
-                player: playerMap.get(allocation.player_id) ?? null,
-                description: allocation.description || "Membership payment",
-                category: "Membership",
-                date: payment.payment_date,
-                amount: Number(allocation.amount || 0),
-                kind: "income",
-                isReversed: Boolean(reversalInfo),
-                reversedAt: reversalInfo?.reversedAt,
-                reversalReason: reversalInfo?.reason,
-              },
-              createdAt: payment.created_at,
-            };
-          },
-        );
-
-      const expenses: DatedTransaction[] = expenseRows.map((item) => ({
-        transaction: {
-          id: `expense-${item.id}`,
-          player: null,
-          description: item.title,
-          category: item.category || "Other",
-          date: item.expense_date,
-          amount: Number(item.amount || 0),
-          kind: "expense",
-        },
-        createdAt: item.created_at,
-      }));
-
-      // Sort by transaction date, then recording timestamp, then ID.
-      const combined = [...income, ...membershipIncome, ...expenses].sort(
-        (a, b) => {
-          const dateComparison = b.transaction.date.localeCompare(
-            a.transaction.date,
-          );
-
-          if (dateComparison !== 0) return dateComparison;
-
-          const timestampComparison =
-            new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-
-          if (timestampComparison !== 0) return timestampComparison;
-
-          return b.transaction.id.localeCompare(a.transaction.id);
-        },
-      );
-
-      setTransactions(combined.map((item) => item.transaction));
-    } catch (err) {
-      if (requestId !== fetchRequestRef.current) return;
-
-      console.error("Failed to fetch transactions:", err);
-      setError("Unable to load transactions. Please try again.");
-      setTransactions([]);
-    } finally {
-      if (requestId === fetchRequestRef.current) {
-        setLoading(false);
-      }
-    }
-  }, [user, activeWorkspace, workspaceLoading]);
-
-  useEffect(() => {
-    void fetchTransactions();
-  }, [fetchTransactions]);
+    await refetch();
+  }, [enabled, serverId, refetch]);
 
   return {
     transactions,
-    loading,
-    error,
+    loading: workspaceLoading || (enabled && transactionsQuery.isPending),
+    error: transactionsQuery.error
+      ? "Unable to load transactions. Please try again."
+      : "",
     refresh: fetchTransactions,
   };
 }

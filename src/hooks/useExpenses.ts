@@ -1,5 +1,6 @@
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../contexts/AuthContext";
 import {
   APPROVAL_SUBMITTED_MESSAGE,
@@ -8,56 +9,73 @@ import {
 import { supabase } from "../lib/supabase";
 import type { Expense, ExpenseFormValues } from "../types/expense";
 
+async function fetchExpensesData(serverId: string): Promise<Expense[]> {
+  const { data, error } = await supabase
+    .from("expenses")
+    .select("id, title, category, amount, expense_date, notes")
+    .eq("server_id", serverId)
+    .order("expense_date", { ascending: false });
+
+  if (error) {
+    console.error("Failed to fetch expenses:", error);
+    throw error;
+  }
+
+  return (data ?? []) as Expense[];
+}
+
 export function useExpenses() {
   const { user, activeWorkspace, workspaceLoading } = useAuth();
+  const queryClient = useQueryClient();
 
-  const [expenses, setExpenses] = useState<Expense[]>([]);
-  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  const fetchRequestRef = useRef(0);
+  const serverId = activeWorkspace?.server_id ?? null;
+  const enabled = Boolean(user && serverId && !workspaceLoading);
+
+  const queryKey = ["expenses", serverId] as const;
+
+  const expensesQuery = useQuery({
+    queryKey,
+    queryFn: () => fetchExpensesData(serverId!),
+    enabled,
+  });
+
+  const expenses = expensesQuery.data ?? [];
+
+  // Subscribe to expense changes in the active workspace.
+  useEffect(() => {
+    if (!enabled || !serverId) return;
+
+    const channel = supabase
+      .channel(`expenses-${serverId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "expenses",
+          filter: `server_id=eq.${serverId}`,
+        },
+        () => {
+          void queryClient.invalidateQueries({
+            queryKey: ["expenses", serverId],
+          });
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [enabled, serverId, queryClient]);
 
   const fetchExpenses = useCallback(async () => {
-    const requestId = ++fetchRequestRef.current;
+    if (!enabled || !serverId) return;
 
-    if (workspaceLoading) {
-      setLoading(true);
-      return;
-    }
-
-    if (!user || !activeWorkspace) {
-      setExpenses([]);
-      setLoading(false);
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-    setExpenses([]);
-
-    const { data, error: fetchError } = await supabase
-      .from("expenses")
-      .select("id, title, category, amount, expense_date, notes")
-      .eq("server_id", activeWorkspace.server_id)
-      .order("expense_date", { ascending: false });
-
-    if (requestId !== fetchRequestRef.current) return;
-
-    if (fetchError) {
-      console.error("Failed to fetch expenses:", fetchError);
-      setError(fetchError.message);
-      setExpenses([]);
-    } else {
-      setExpenses((data ?? []) as Expense[]);
-    }
-
-    setLoading(false);
-  }, [user, activeWorkspace, workspaceLoading]);
-
-  useEffect(() => {
-    void fetchExpenses();
-  }, [fetchExpenses]);
+    await expensesQuery.refetch();
+  }, [enabled, serverId, expensesQuery.refetch]);
 
   const saveExpense = async (
     values: ExpenseFormValues,
@@ -94,7 +112,7 @@ export function useExpenses() {
     setError("");
 
     try {
-      const serverId = activeWorkspace.server_id;
+      const currentServerId = activeWorkspace.server_id;
 
       const payload = {
         title: values.title.trim(),
@@ -105,7 +123,7 @@ export function useExpenses() {
       };
 
       const submitted = await submitApprovalIfRequired({
-        serverId,
+        serverId: currentServerId,
         requestType: editingExpense ? "expense.update" : "expense.create",
         payload: editingExpense
           ? {
@@ -124,11 +142,11 @@ export function useExpenses() {
             .from("expenses")
             .update(payload)
             .eq("id", editingExpense.id)
-            .eq("server_id", serverId)
+            .eq("server_id", currentServerId)
         : await supabase.from("expenses").insert({
             ...payload,
             owner_id: activeWorkspace.owner_id,
-            server_id: serverId,
+            server_id: currentServerId,
           });
 
       if (result.error) {
@@ -136,7 +154,10 @@ export function useExpenses() {
         return result.error.message;
       }
 
-      await fetchExpenses();
+      await queryClient.invalidateQueries({
+        queryKey: ["expenses", currentServerId],
+      });
+
       return null;
     } catch (saveError) {
       console.error("Unexpected error saving expense:", saveError);
@@ -146,7 +167,9 @@ export function useExpenses() {
     }
   };
 
-  const deleteExpense = async (expense: Expense): Promise<string | null> => {
+  const deleteExpense = async (
+    expense: Expense,
+  ): Promise<string | null> => {
     if (!user) return "You must be signed in to delete an expense.";
 
     if (workspaceLoading || !activeWorkspace) {
@@ -157,13 +180,13 @@ export function useExpenses() {
       return "This expense does not belong to the active workspace.";
     }
 
-    const serverId = activeWorkspace.server_id;
+    const currentServerId = activeWorkspace.server_id;
 
     const { error: deleteError } = await supabase
       .from("expenses")
       .delete()
       .eq("id", expense.id)
-      .eq("server_id", serverId);
+      .eq("server_id", currentServerId);
 
     if (deleteError) {
       console.error("Failed to delete expense:", deleteError);
@@ -171,15 +194,18 @@ export function useExpenses() {
       return deleteError.message;
     }
 
-    await fetchExpenses();
+    await queryClient.invalidateQueries({
+      queryKey: ["expenses", currentServerId],
+    });
+
     return null;
   };
 
   return {
     expenses,
-    loading,
+    loading: workspaceLoading || (enabled && expensesQuery.isPending),
     saving,
-    error,
+    error: error || (expensesQuery.error?.message ?? ""),
     setError,
     fetchExpenses,
     saveExpense,

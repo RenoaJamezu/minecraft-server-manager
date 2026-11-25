@@ -1,5 +1,4 @@
-
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   RefreshCw,
   UserPlus,
@@ -9,40 +8,9 @@ import {
   Trash2,
   KeyRound,
 } from "lucide-react";
-import { supabase } from "../lib/supabase";
 import { useAuth } from "../contexts/AuthContext";
-
-interface StaffMember {
-  id: string;
-  user_id: string | null;
-  email: string;
-  role_id: string;
-  role_name: string | null;
-  status: "invited" | "active" | "suspended";
-  created_at: string;
-}
-
-interface StaffRole {
-  id: string;
-  name: string;
-  role_key: string;
-  is_system: boolean;
-  is_editable: boolean;
-}
-
-interface StaffData {
-  members: StaffMember[];
-  roles: StaffRole[];
-}
-
-interface AuditEntry {
-  id: string;
-  action: string;
-  actor_label: string | null;
-  target_id: string | null;
-  details: Record<string, unknown>;
-  created_at: string;
-}
+import { useStaff } from "../hooks/useStaff";
+import type { StaffMember } from "../types/staff";
 
 function getMemberLabel(email: string) {
   return email.endsWith("@staff.invalid")
@@ -50,82 +18,60 @@ function getMemberLabel(email: string) {
     : email;
 }
 
-function getExpectedAuditAction(
-  action: "change_role" | "suspend" | "activate" | "remove",
-) {
-  switch (action) {
-    case "change_role":
-      return "staff.role_changed";
-    case "suspend":
-      return "staff.suspended";
-    case "activate":
-      return "staff.activated";
-    case "remove":
-      return "staff.removed";
+function statusStyle(status: StaffMember["status"]) {
+  switch (status) {
+    case "active":
+      return "bg-emerald-500/10 text-emerald-400";
+    case "invited":
+      return "bg-amber-500/10 text-amber-400";
+    case "suspended":
+      return "bg-red-500/10 text-red-400";
   }
 }
 
 export default function Staff() {
   const { user, activeWorkspace, hasPermission } = useAuth();
 
-  const [members, setMembers] = useState<StaffMember[]>([]);
-  const [roles, setRoles] = useState<StaffRole[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [creatingAccount, setCreatingAccount] = useState(false);
-  const [busyMemberId, setBusyMemberId] = useState<string | null>(null);
+  const serverId = activeWorkspace?.server_id;
+
+  const {
+    members,
+    roles,
+    loading,
+    refreshing,
+    creatingAccount,
+    busyMemberId,
+    error,
+    notice,
+    setNotice,
+    loadStaff,
+    createStaffAccount,
+    manageMember,
+  } = useStaff(serverId);
 
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [roleId, setRoleId] = useState("");
 
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-
-  const serverId = activeWorkspace?.server_id;
-
   const canInvite = hasPermission("staff.invite");
   const canChangeRole = hasPermission("staff.update_role");
   const canSuspend = hasPermission("staff.suspend");
   const canRemove = hasPermission("staff.remove");
 
-  const loadStaff = useCallback(async () => {
-    if (!serverId) return;
-
-    setLoading(true);
-    setError("");
-
-    try {
-      const { data, error: rpcError } = await supabase.rpc(
-        "get_server_staff_data",
-        { p_server_id: serverId },
-      );
-
-      if (rpcError) throw rpcError;
-
-      const result = data as StaffData;
-
-      setMembers(result.members ?? []);
-      setRoles(result.roles ?? []);
-
-      setRoleId((current) =>
-        current && result.roles?.some((role) => role.id === current)
-          ? current
-          : (result.roles?.[0]?.id ?? ""),
-      );
-    } catch (err) {
-      console.error("Failed to load staff:", err);
-      setError(
-        err instanceof Error ? err.message : "Unable to load workspace staff.",
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [serverId]);
-
+  // Select the first available role when no valid role is selected.
   useEffect(() => {
-    void loadStaff();
-  }, [loadStaff]);
+    if (roles.length === 0) {
+      setRoleId("");
+      return;
+    }
+
+    setRoleId((current) =>
+      current && roles.some((role) => role.id === current)
+        ? current
+        : roles[0].id,
+    );
+  }, [roles]);
 
   async function handleCreateAccount(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -135,194 +81,24 @@ export default function Staff() {
     const normalizedUsername = username.trim().toLowerCase();
 
     if (!/^[a-z0-9._-]{3,24}$/.test(normalizedUsername)) {
-      setError(
-        "Username must be 3–24 characters and use only letters, numbers, dots, underscores, or hyphens.",
-      );
       return;
     }
 
     if (password.length < 8) {
-      setError("Temporary password must be at least 8 characters.");
       return;
     }
 
-    setCreatingAccount(true);
-    setError("");
-    setNotice("");
+    const success = await createStaffAccount({
+      username: normalizedUsername,
+      displayName: displayName.trim(),
+      password,
+      roleId,
+    });
 
-    try {
-      const { data, error: functionError } = await supabase.functions.invoke(
-        "create-staff-account",
-        {
-          body: {
-            serverId,
-            username: normalizedUsername,
-            displayName: displayName.trim(),
-            password,
-            roleId,
-          },
-        },
-      );
-
-      if (functionError) {
-        let message = functionError.message;
-
-        try {
-          const response = await functionError.context?.json();
-          if (response?.error) message = response.error;
-        } catch {
-          // Keep the original function error message.
-        }
-
-        throw new Error(message);
-      }
-
-      if (!data?.success) {
-        throw new Error(data?.error ?? "Unable to create staff account.");
-      }
-
-      setNotice(
-        `Account "${normalizedUsername}" created successfully. Give the staff member their username and temporary password.`,
-      );
-
+    if (success) {
       setUsername("");
       setDisplayName("");
       setPassword("");
-
-      await loadStaff();
-    } catch (err) {
-      console.error("Failed to create staff account:", err);
-      setError(
-        err instanceof Error ? err.message : "Unable to create staff account.",
-      );
-    } finally {
-      setCreatingAccount(false);
-    }
-  }
-
-  async function manageMember(
-    member: StaffMember,
-    action: "change_role" | "suspend" | "activate" | "remove",
-    nextRoleId?: string,
-  ) {
-    if (!serverId) {
-      console.error("[Staff Audit] Missing server ID.");
-      return;
-    }
-
-    if (action === "change_role" && nextRoleId === member.role_id) {
-      return;
-    }
-
-    const label = getMemberLabel(member.email);
-    const expectedAction = getExpectedAuditAction(action);
-
-    if (
-      action === "remove" &&
-      !window.confirm(
-        `Remove ${label} from this workspace? This cannot be undone.`,
-      )
-    ) {
-      return;
-    }
-
-    setBusyMemberId(member.id);
-    setError("");
-    setNotice("");
-
-    console.groupCollapsed("[Staff Audit] Starting staff action");
-    console.info("Server ID:", serverId);
-    console.info("Membership ID:", member.id);
-    console.info("Target username:", label);
-    console.info("Action:", action);
-    console.info("Expected audit action:", expectedAction);
-    console.info("Next role ID:", nextRoleId ?? null);
-    console.groupEnd();
-
-    try {
-      const { error: actionError } = await supabase.rpc(
-        "manage_server_member",
-        {
-          p_server_id: serverId,
-          p_membership_id: member.id,
-          p_action: action,
-          p_role_id: nextRoleId ?? null,
-        },
-      );
-
-      if (actionError) {
-        console.error("[Staff Audit] RPC failed:", actionError);
-        throw actionError;
-      }
-
-      console.info("[Staff Audit] RPC succeeded.");
-
-      // Verify that the database created the expected audit entry.
-      const { data: auditEntry, error: auditError } = await supabase
-        .from("server_audit_logs")
-        .select(
-          "id, action, actor_label, target_id, details, created_at",
-        )
-        .eq("server_id", serverId)
-        .eq("target_id", member.id)
-        .eq("action", expectedAction)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (auditError) {
-        console.error(
-          "[Staff Audit] Could not read audit entry:",
-          auditError,
-        );
-        console.error(
-          "[Staff Audit] Check owner SELECT policy and RLS.",
-        );
-      } else if (!auditEntry) {
-        console.warn(
-          "[Staff Audit] RPC succeeded, but no matching audit entry was visible.",
-        );
-        console.warn("Expected server ID:", serverId);
-        console.warn("Expected membership ID:", member.id);
-        console.warn("Expected action:", expectedAction);
-      } else {
-        console.info(
-          "[Staff Audit] Audit entry verified:",
-          auditEntry as AuditEntry,
-        );
-      }
-
-      setNotice(
-        action === "remove"
-          ? `${label} was removed.`
-          : action === "suspend"
-            ? `${label} was suspended.`
-            : action === "activate"
-              ? `${label} was reactivated.`
-              : `Role updated for ${label}.`,
-      );
-
-      await loadStaff();
-    } catch (err) {
-      console.error("[Staff Audit] Failed to manage staff member:", err);
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to update this staff member.",
-      );
-    } finally {
-      setBusyMemberId(null);
-    }
-  }
-
-  function statusStyle(status: StaffMember["status"]) {
-    switch (status) {
-      case "active":
-        return "bg-emerald-500/10 text-emerald-400";
-      case "invited":
-        return "bg-amber-500/10 text-amber-400";
-      case "suspended":
-        return "bg-red-500/10 text-red-400";
     }
   }
 
@@ -343,10 +119,10 @@ export default function Staff() {
         <button
           type="button"
           onClick={() => void loadStaff()}
-          disabled={loading}
+          disabled={refreshing}
           className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 px-4 py-2.5 text-sm text-zinc-300 transition hover:bg-white/[0.04] disabled:opacity-50"
         >
-          <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+          <RefreshCw size={16} className={refreshing ? "animate-spin" : ""} />
           Refresh
         </button>
       </div>
@@ -360,6 +136,13 @@ export default function Staff() {
       {notice && (
         <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-400">
           {notice}
+          <button
+            type="button"
+            onClick={() => setNotice("")}
+            className="ml-3 text-xs underline"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -468,8 +251,8 @@ export default function Staff() {
 
           <p className="mt-3 text-xs text-zinc-500">
             Give the staff member their username and temporary password
-            securely. They will be asked to change the password after signing
-            in once that requirement is enabled.
+            securely. They will be asked to change the password after signing in
+            once that requirement is enabled.
           </p>
         </section>
       )}

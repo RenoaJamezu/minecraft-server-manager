@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase } from "../lib/supabase";
 import {
@@ -7,52 +8,43 @@ import {
 } from "../lib/approval";
 import type { WalletTopUpFormValues, WalletTopUpResult } from "../types/wallet";
 
+async function checkWalletTopUpPermission(serverId: string) {
+  const [approverResult, adjustResult, requestResult] = await Promise.all([
+    supabase.rpc("is_server_approver", {
+      p_server_id: serverId,
+    }),
+    supabase.rpc("has_server_permission", {
+      p_server_id: serverId,
+      p_permission_key: "wallets.adjust",
+    }),
+    supabase.rpc("has_server_permission", {
+      p_server_id: serverId,
+      p_permission_key: "wallets.request_top_up",
+    }),
+  ]);
+
+  return (
+    (!approverResult.error && approverResult.data === true) ||
+    (!adjustResult.error && adjustResult.data === true) ||
+    (!requestResult.error && requestResult.data === true)
+  );
+}
+
 export function useWalletTopUp(fetchWallets: () => Promise<void>) {
+  const queryClient = useQueryClient();
   const { user, activeWorkspace, workspaceLoading } = useAuth();
 
-  const [canAddWalletBalance, setCanAddWalletBalance] = useState(false);
   const [savingTopUp, setSavingTopUp] = useState(false);
 
   const serverId = activeWorkspace?.server_id ?? null;
 
-  useEffect(() => {
-    let active = true;
+  const permissionQuery = useQuery({
+    queryKey: ["wallet-top-up-permission", serverId, user?.id],
+    queryFn: () => checkWalletTopUpPermission(serverId!),
+    enabled: Boolean(user && serverId && !workspaceLoading),
+  });
 
-    const checkPermission = async () => {
-      if (workspaceLoading || !user || !serverId) {
-        setCanAddWalletBalance(false);
-        return;
-      }
-
-      const [approverResult, adjustResult, requestResult] = await Promise.all([
-        supabase.rpc("is_server_approver", {
-          p_server_id: serverId,
-        }),
-        supabase.rpc("has_server_permission", {
-          p_server_id: serverId,
-          p_permission_key: "wallets.adjust",
-        }),
-        supabase.rpc("has_server_permission", {
-          p_server_id: serverId,
-          p_permission_key: "wallets.request_top_up",
-        }),
-      ]);
-
-      if (!active) return;
-
-      setCanAddWalletBalance(
-        (!approverResult.error && approverResult.data === true) ||
-          (!adjustResult.error && adjustResult.data === true) ||
-          (!requestResult.error && requestResult.data === true),
-      );
-    };
-
-    void checkPermission();
-
-    return () => {
-      active = false;
-    };
-  }, [user, serverId, workspaceLoading]);
+  const canAddWalletBalance = permissionQuery.data ?? false;
 
   const addWalletBalance = useCallback(
     async (
@@ -61,6 +53,12 @@ export function useWalletTopUp(fetchWallets: () => Promise<void>) {
       if (!user || !serverId || workspaceLoading) {
         return {
           error: "Select a workspace before adding wallet balance.",
+        };
+      }
+
+      if (permissionQuery.isPending) {
+        return {
+          error: "Checking wallet permissions. Please try again.",
         };
       }
 
@@ -89,13 +87,15 @@ export function useWalletTopUp(fetchWallets: () => Promise<void>) {
       setSavingTopUp(true);
 
       try {
+        const description = values.description?.trim() || null;
+
         const approvalSubmitted = await submitApprovalIfRequired({
           serverId,
           requestType: "wallet.top_up",
           payload: {
             player_id: values.player_id,
             amount,
-            description: values.description?.trim() || null,
+            description,
           },
         });
 
@@ -109,7 +109,7 @@ export function useWalletTopUp(fetchWallets: () => Promise<void>) {
             p_server_id: serverId,
             p_player_id: values.player_id,
             p_amount: amount,
-            p_description: values.description?.trim() || null,
+            p_description: description,
           },
         );
 
@@ -132,7 +132,12 @@ export function useWalletTopUp(fetchWallets: () => Promise<void>) {
           };
         }
 
-        await fetchWallets();
+        await Promise.all([
+          fetchWallets(),
+          queryClient.invalidateQueries({
+            queryKey: ["wallet-history", serverId],
+          }),
+        ]);
 
         return { error: null, result };
       } catch (topUpError) {
@@ -152,11 +157,20 @@ export function useWalletTopUp(fetchWallets: () => Promise<void>) {
         setSavingTopUp(false);
       }
     },
-    [user, serverId, workspaceLoading, canAddWalletBalance, fetchWallets],
+    [
+      user,
+      serverId,
+      workspaceLoading,
+      permissionQuery.isPending,
+      canAddWalletBalance,
+      fetchWallets,
+      queryClient,
+    ],
   );
 
   return {
     canAddWalletBalance,
+    permissionLoading: permissionQuery.isPending,
     savingTopUp,
     addWalletBalance,
   };

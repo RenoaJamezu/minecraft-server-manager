@@ -1,5 +1,5 @@
-
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuth } from "../contexts/AuthContext";
 import {
   APPROVAL_SUBMITTED_MESSAGE,
@@ -24,6 +24,8 @@ interface MembershipCoverage {
   grace_ends_at: string | null;
   next_period_start: string | null;
 }
+
+const playersQueryKey = (serverId: string) => ["players", serverId] as const;
 
 function getLocalDateString(date = new Date()) {
   const year = date.getFullYear();
@@ -134,134 +136,155 @@ function calculateMembershipCoverage(
   };
 }
 
-export function usePlayers() {
-  const { user, activeWorkspace, workspaceLoading } = useAuth();
+async function fetchPlayersData(serverId: string): Promise<Player[]> {
+  const { data: playerData, error: playerError } = await supabase
+    .from("players")
+    .select(
+      "id, minecraft_username, discord_username, monthly_fee, status, joined_at, notes, titles, ban_reason, banned_at",
+    )
+    .eq("server_id", serverId)
+    .order("minecraft_username", { ascending: true });
 
-  const [players, setPlayers] = useState<Player[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
+  if (playerError) {
+    console.error("Failed to fetch players:", playerError);
+    throw new Error("Unable to load players. Please try again.");
+  }
 
-  const fetchRequestRef = useRef(0);
+  const fetchedPlayers = playerData ?? [];
 
-  const fetchPlayers = useCallback(async () => {
-    const requestId = ++fetchRequestRef.current;
+  if (fetchedPlayers.length === 0) {
+    return [];
+  }
 
-    if (workspaceLoading) {
-      setLoading(true);
-      return;
-    }
+  const playerIds = fetchedPlayers.map((player) => player.id);
 
-    if (!user || !activeWorkspace) {
-      setPlayers([]);
-      setLoading(false);
-      return;
-    }
-
-    const serverId = activeWorkspace.server_id;
-
-    setLoading(true);
-    setError("");
-    setPlayers([]);
-
-    const { data: playerData, error: playerError } = await supabase
-      .from("players")
-      .select(
-        "id, minecraft_username, discord_username, monthly_fee, status, joined_at, notes, titles, ban_reason, banned_at",
-      )
+  const [balancesResult, periodsResult] = await Promise.all([
+    supabase
+      .from("player_wallet_balances")
+      .select("player_id, balance, server_id")
       .eq("server_id", serverId)
-      .order("minecraft_username", { ascending: true });
+      .in("player_id", playerIds),
 
-    if (requestId !== fetchRequestRef.current) return;
+    supabase
+      .from("membership_periods")
+      .select("player_id, period_start, period_end")
+      .eq("server_id", serverId)
+      .in("player_id", playerIds)
+      .is("reversed_at", null)
+      .order("period_end", { ascending: false }),
+  ]);
 
-    if (playerError) {
-      console.error("Failed to fetch players:", playerError);
-      setError("Unable to load players. Please try again.");
-      setPlayers([]);
-      setLoading(false);
-      return;
-    }
-
-    const fetchedPlayers = playerData ?? [];
-
-    if (fetchedPlayers.length === 0) {
-      setPlayers([]);
-      setLoading(false);
-      return;
-    }
-
-    const playerIds = fetchedPlayers.map((player) => player.id);
-
-    const [balancesResult, periodsResult] = await Promise.all([
-      supabase
-        .from("player_wallet_balances")
-        .select("player_id, balance, server_id")
-        .eq("server_id", serverId)
-        .in("player_id", playerIds),
-
-      supabase
-        .from("membership_periods")
-        .select("player_id, period_start, period_end")
-        .eq("server_id", serverId)
-        .in("player_id", playerIds)
-        .is("reversed_at", null)
-        .order("period_end", { ascending: false }),
-    ]);
-
-    if (requestId !== fetchRequestRef.current) return;
-
-    const secondaryError = balancesResult.error || periodsResult.error;
-
-    if (secondaryError) {
-      console.error("Failed to fetch player balances or membership periods:", {
-        balancesError: balancesResult.error,
-        periodsError: periodsResult.error,
-      });
-
-      setError("Unable to load complete player information. Please try again.");
-      setPlayers([]);
-      setLoading(false);
-      return;
-    }
-
-    const balanceMap = new Map<string, number>();
-
-    for (const row of balancesResult.data ?? []) {
-      if (row.player_id) {
-        balanceMap.set(row.player_id, Number(row.balance ?? 0));
-      }
-    }
-
-    const periodsByPlayer = new Map<string, MembershipPeriod[]>();
-
-    for (const period of (periodsResult.data ?? []) as MembershipPeriod[]) {
-      const existing = periodsByPlayer.get(period.player_id) ?? [];
-      existing.push(period);
-      periodsByPlayer.set(period.player_id, existing);
-    }
-
-    const today = getLocalDateString();
-
-    const mappedPlayers: Player[] = fetchedPlayers.map((player) => {
-      const periods = periodsByPlayer.get(player.id) ?? [];
-      const coverage = calculateMembershipCoverage(periods, today);
-
-      return {
-        ...player,
-        monthly_fee: Number(player.monthly_fee),
-        titles: normalizePlayerTitles(player.titles),
-        wallet_balance: balanceMap.get(player.id) ?? 0,
-        ...coverage,
-      };
+  if (balancesResult.error || periodsResult.error) {
+    console.error("Failed to fetch player balances or membership periods:", {
+      balancesError: balancesResult.error,
+      periodsError: periodsResult.error,
     });
 
-    setPlayers(mappedPlayers);
-    setLoading(false);
-  }, [user, activeWorkspace, workspaceLoading]);
+    throw new Error(
+      "Unable to load complete player information. Please try again.",
+    );
+  }
+
+  const balanceMap = new Map<string, number>();
+
+  for (const row of balancesResult.data ?? []) {
+    if (row.player_id) {
+      balanceMap.set(row.player_id, Number(row.balance ?? 0));
+    }
+  }
+
+  const periodsByPlayer = new Map<string, MembershipPeriod[]>();
+
+  for (const period of (periodsResult.data ?? []) as MembershipPeriod[]) {
+    const existing = periodsByPlayer.get(period.player_id) ?? [];
+    existing.push(period);
+    periodsByPlayer.set(period.player_id, existing);
+  }
+
+  const today = getLocalDateString();
+
+  return fetchedPlayers.map((player) => {
+    const periods = periodsByPlayer.get(player.id) ?? [];
+    const coverage = calculateMembershipCoverage(periods, today);
+
+    return {
+      ...player,
+      monthly_fee: Number(player.monthly_fee),
+      titles: normalizePlayerTitles(player.titles),
+      wallet_balance: balanceMap.get(player.id) ?? 0,
+      ...coverage,
+    };
+  });
+}
+
+export function usePlayers() {
+  const { user, activeWorkspace, workspaceLoading } = useAuth();
+  const queryClient = useQueryClient();
+
+  const [saving, setSaving] = useState(false);
+
+  const serverId = activeWorkspace?.server_id ?? null;
+  const enabled = Boolean(user && serverId && !workspaceLoading);
+
+  const playersQuery = useQuery({
+    queryKey: playersQueryKey(serverId ?? "no-workspace"),
+    queryFn: () => fetchPlayersData(serverId!),
+    enabled,
+  });
 
   useEffect(() => {
-    void fetchPlayers();
-  }, [fetchPlayers]);
+    if (!enabled || !serverId) return;
+
+    const invalidatePlayers = (payload: unknown) => {
+      console.info("[Players Realtime] Change received:", payload);
+
+      void queryClient.invalidateQueries({
+        queryKey: playersQueryKey(serverId),
+      });
+    };
+
+    const channel = supabase
+      .channel(`players-${serverId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "players",
+          filter: `server_id=eq.${serverId}`,
+        },
+        invalidatePlayers,
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "membership_periods",
+          filter: `server_id=eq.${serverId}`,
+        },
+        invalidatePlayers,
+      )
+      .subscribe((status, error) => {
+        console.info("[Players Realtime] Status:", status);
+
+        if (error) {
+          console.error("[Players Realtime] Subscription error:", error);
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [enabled, serverId, queryClient]);
+
+  const { refetch } = playersQuery;
+
+  const fetchPlayers = useCallback(async () => {
+    if (!enabled || !serverId) return;
+
+    await refetch();
+  }, [enabled, serverId, refetch]);
 
   const savePlayer = async (
     values: PlayerFormValues,
@@ -288,12 +311,14 @@ export function usePlayers() {
 
     if (
       editingPlayer &&
-      !players.some((player) => player.id === editingPlayer.id)
+      !(playersQuery.data ?? []).some(
+        (player) => player.id === editingPlayer.id,
+      )
     ) {
       return "This player does not belong to the active workspace.";
     }
 
-    const serverId = activeWorkspace.server_id;
+    const currentServerId = activeWorkspace.server_id;
 
     const payload = {
       minecraft_username: username,
@@ -308,7 +333,7 @@ export function usePlayers() {
 
     try {
       const submitted = await submitApprovalIfRequired({
-        serverId,
+        serverId: currentServerId,
         requestType: editingPlayer ? "player.update" : "player.create",
         payload: editingPlayer
           ? {
@@ -327,12 +352,14 @@ export function usePlayers() {
           .from("players")
           .update(payload)
           .eq("id", editingPlayer.id)
-          .eq("server_id", serverId);
+          .eq("server_id", currentServerId);
 
         if (updateError) {
           console.error("Failed to update player:", updateError);
 
-          await fetchPlayers();
+          await queryClient.invalidateQueries({
+            queryKey: playersQueryKey(currentServerId),
+          });
 
           return updateError.code === "23505"
             ? "That Minecraft username already exists."
@@ -343,7 +370,7 @@ export function usePlayers() {
           ...payload,
           status: "active",
           owner_id: activeWorkspace.owner_id,
-          server_id: serverId,
+          server_id: currentServerId,
         });
 
         if (insertError) {
@@ -355,7 +382,9 @@ export function usePlayers() {
         }
       }
 
-      await fetchPlayers();
+      await queryClient.invalidateQueries({
+        queryKey: playersQueryKey(currentServerId),
+      });
 
       return null;
     } catch (saveError) {
@@ -368,10 +397,10 @@ export function usePlayers() {
   };
 
   return {
-    players,
-    loading,
+    players: playersQuery.data ?? [],
+    loading: workspaceLoading || (enabled && playersQuery.isPending),
     saving,
-    error,
+    error: playersQuery.error?.message ?? "",
     fetchPlayers,
     savePlayer,
   };

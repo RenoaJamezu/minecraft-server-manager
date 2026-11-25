@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { Session, User } from "@supabase/supabase-js";
 import { supabase } from "../lib/supabase";
 
@@ -68,6 +69,8 @@ const PAGE_PERMISSIONS: PermissionKey[] = [
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const queryClient = useQueryClient();
+
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -87,29 +90,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const permissionRequestRef = useRef(0);
   const currentUserIdRef = useRef<string | null>(null);
 
+  const userId = user?.id ?? null;
+
   const mustChangePassword =
     user?.app_metadata?.must_change_password === true;
 
   const refreshWorkspaces = useCallback(async () => {
     const requestId = ++workspaceRequestRef.current;
 
-    setWorkspaces([]);
-    setWorkspacesUserId("");
-    setActiveWorkspaceIdState("");
-    setWorkspaceError("");
-    setPermissions({});
-    setPermissionWorkspaceId("");
-
-    if (!user) {
+    if (!userId) {
+      setWorkspaces([]);
+      setWorkspacesUserId("");
+      setActiveWorkspaceIdState("");
+      setWorkspaceError("");
+      setPermissions({});
+      setPermissionWorkspaceId("");
       setWorkspaceLoading(false);
       setPermissionRequestLoading(false);
       return;
     }
 
+    setWorkspaceError("");
     setWorkspaceLoading(true);
 
     try {
-      // Keep support for any existing pending invitations.
       const { error: invitationError } = await supabase.rpc(
         "accept_my_server_invitations",
       );
@@ -123,9 +127,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       if (requestId !== workspaceRequestRef.current) return;
 
-      const { data, error } = await supabase.rpc(
-        "list_my_server_workspaces",
-      );
+      const { data, error } = await supabase.rpc("list_my_server_workspaces");
 
       if (error) throw error;
 
@@ -134,7 +136,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const available = (data ?? []) as ServerWorkspace[];
 
       const savedId = localStorage.getItem(
-        `minecraft-server-manager-workspace:${user.id}`,
+        `minecraft-server-manager-workspace:${userId}`,
       );
 
       const selected =
@@ -143,17 +145,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         null;
 
       setWorkspaces(available);
-      setWorkspacesUserId(user.id);
+      setWorkspacesUserId(userId);
       setActiveWorkspaceIdState(selected?.server_id ?? "");
 
       if (selected) {
         localStorage.setItem(
-          `minecraft-server-manager-workspace:${user.id}`,
+          `minecraft-server-manager-workspace:${userId}`,
           selected.server_id,
         );
       } else {
         localStorage.removeItem(
-          `minecraft-server-manager-workspace:${user.id}`,
+          `minecraft-server-manager-workspace:${userId}`,
         );
       }
     } catch (error) {
@@ -169,7 +171,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setWorkspaceLoading(false);
       }
     }
-  }, [user]);
+  }, [userId]);
 
   useEffect(() => {
     let mounted = true;
@@ -181,11 +183,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         console.error("Failed to retrieve session:", error);
       }
 
-      if (mounted) {
-        setSession(data.session);
-        setUser(data.session?.user ?? null);
-        setLoading(false);
-      }
+      if (!mounted) return;
+
+      const initialSession = data.session;
+      const initialUserId = initialSession?.user.id ?? null;
+
+      currentUserIdRef.current = initialUserId;
+
+      setSession(initialSession);
+      setUser(initialSession?.user ?? null);
+      setLoading(false);
     }
 
     void initializeAuth();
@@ -194,9 +201,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       const nextUserId = nextSession?.user.id ?? null;
+      const previousUserId = currentUserIdRef.current;
 
-      if (currentUserIdRef.current !== nextUserId) {
+      if (previousUserId !== nextUserId) {
         currentUserIdRef.current = nextUserId;
+
+        // Prevent cached data from one account being reused by another.
+        queryClient.clear();
 
         workspaceRequestRef.current += 1;
         permissionRequestRef.current += 1;
@@ -220,7 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       mounted = false;
       subscription.unsubscribe();
     };
-  }, []);
+  }, [queryClient]);
 
   useEffect(() => {
     if (!loading) {
@@ -242,18 +253,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         (item) => item.server_id === serverId,
       );
 
-      if (!workspace || !user) return;
+      if (!workspace || !userId) return;
 
       setPermissions({});
       setPermissionWorkspaceId("");
       setActiveWorkspaceIdState(serverId);
 
       localStorage.setItem(
-        `minecraft-server-manager-workspace:${user.id}`,
+        `minecraft-server-manager-workspace:${userId}`,
         serverId,
       );
     },
-    [user, visibleWorkspaces],
+    [userId, visibleWorkspaces],
   );
 
   useEffect(() => {
@@ -262,7 +273,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setPermissions({});
     setPermissionWorkspaceId("");
 
-    if (workspaceLoading || !user || !activeWorkspace) {
+    if (workspaceLoading || !userId || !activeWorkspace) {
       setPermissionRequestLoading(false);
       return;
     }
@@ -288,6 +299,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 `Failed to check permission "${permission}":`,
                 error,
               );
+
               return [permission, false] as const;
             }
 
@@ -313,7 +325,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [user?.id, activeWorkspace?.server_id, workspaceLoading]);
+  }, [userId, activeWorkspace?.server_id, workspaceLoading]);
 
   const permissionsLoading =
     !!activeWorkspace &&
