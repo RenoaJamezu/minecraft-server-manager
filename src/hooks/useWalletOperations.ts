@@ -1,4 +1,5 @@
 import { useCallback, type Dispatch, type SetStateAction } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { supabase } from "../lib/supabase";
 import {
   APPROVAL_SUBMITTED_MESSAGE,
@@ -35,6 +36,8 @@ export function useWalletOperations({
   refreshAffectedHistory,
   setSaving,
 }: UseWalletOperationsOptions) {
+  const queryClient = useQueryClient();
+
   const recordPayment = useCallback(
     async (
       values: PaymentFormValues,
@@ -201,6 +204,9 @@ export function useWalletOperations({
         await Promise.all([
           fetchWallets(),
           refreshAffectedHistory(affectedPlayerIds),
+          queryClient.invalidateQueries({
+            queryKey: ["players", serverId],
+          }),
         ]);
 
         return { error: null, result };
@@ -221,6 +227,7 @@ export function useWalletOperations({
       players,
       fetchWallets,
       refreshAffectedHistory,
+      queryClient,
       setSaving,
     ],
   );
@@ -351,6 +358,9 @@ export function useWalletOperations({
         await Promise.all([
           fetchWallets(),
           refreshAffectedHistory([values.player_id]),
+          queryClient.invalidateQueries({
+            queryKey: ["players", serverId],
+          }),
         ]);
 
         return { error: null, result };
@@ -372,6 +382,7 @@ export function useWalletOperations({
       players,
       fetchWallets,
       refreshAffectedHistory,
+      queryClient,
       setSaving,
     ],
   );
